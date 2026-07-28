@@ -2,12 +2,18 @@
 rna_model.py
 ------------
 ForensicChrono - RNA-based PMI (postmortem interval) prediction model.
+
+Features are built around a "stable vs degrading" gene split, backed by
+literature: STABLE_GENES stay roughly constant after death (used as the
+normalizer), while DEGRADING_GENES are specifically shown to correlate
+with PMI in muscle tissue (Portela et al., PLOS ONE). The ratio of each
+degrading gene to the stable baseline is the main predictive signal.
 """
 
 import pandas as pd
 import numpy as np
 import gzip
-from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
 from sklearn.model_selection import cross_val_predict, KFold
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.dummy import DummyRegressor
@@ -18,7 +24,19 @@ GENE_READS_PATH = "data/raw/rna/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_r
 
 TARGET_TISSUE = "Muscle - Skeletal"
 
-REFERENCE_GENES = ["GAPDH", "ACTB", "RPS29", "RPS18", "RPL13A", "B2M"]
+# STABLE_GENES: shown to stay relatively constant after death (Penna et al.,
+# PMC3189726) - used as the normalizer/denominator.
+# DEGRADING_GENES: shown to correlate with PMI in muscle tissue (Portela
+# et al., PLOS ONE, PMC3577908) - these carry the actual signal.
+STABLE_GENES = ["CYC1", "RPL13A", "EIF4A2", "B2M", "TOP1"]
+DEGRADING_GENES = ["ACTB", "GAPDH", "PPIA"]
+
+REFERENCE_GENES = list(set(
+    STABLE_GENES + DEGRADING_GENES +
+    ["RPS29", "RPS18", "UBC", "SDHA", "YWHAZ", "RPS10",
+     "TBP", "HPRT1", "PGK1", "POLR2A", "RPLP0", "TUBB",
+     "ALAS1", "IPO8", "PUM1", "HMBS"]
+))
 
 
 def load_sample_metadata():
@@ -61,21 +79,65 @@ def load_reference_gene_expression():
     return expr_df
 
 
-def build_features(expr_df, meta_df):
+def load_subject_phenotypes():
+    print("Loading subject phenotype data...")
+    df = pd.read_csv(SUBJECT_PHENOTYPES_PATH, sep="\t", low_memory=False)
+    df = df[["SUBJID", "SEX", "AGE"]].copy()
+    return df
+
+
+def build_features(expr_df, meta_df, subject_df):
     print("Building features...")
+
     expr_t = expr_df.T
     expr_t.index.name = "SAMPID"
     expr_t = expr_t.reset_index()
 
     merged = pd.merge(expr_t, meta_df, on="SAMPID", how="inner")
 
+    merged["SUBJID"] = merged["SAMPID"].str.split("-").str[:2].str.join("-")
+    merged = pd.merge(merged, subject_df, on="SUBJID", how="left")
+
     gene_cols = [g for g in REFERENCE_GENES if g in merged.columns]
-    merged["ref_gene_mean"] = merged[gene_cols].mean(axis=1)
+    stable_cols = [g for g in STABLE_GENES if g in merged.columns]
+    degrading_cols = [g for g in DEGRADING_GENES if g in merged.columns]
 
     for gene in gene_cols:
-        merged[f"{gene}_ratio"] = merged[gene] / merged["ref_gene_mean"]
+        merged[gene] = np.log1p(merged[gene])
 
-    feature_cols = gene_cols + [f"{g}_ratio" for g in gene_cols] + ["ref_gene_mean"]
+    # Stable baseline: average expression of genes known to hold steady
+    merged["stable_baseline"] = merged[stable_cols].mean(axis=1)
+
+    # Main signal: each degrading gene relative to the stable baseline
+    degrading_ratio_cols = []
+    for gene in degrading_cols:
+        col_name = f"{gene}_vs_stable"
+        merged[col_name] = merged[gene] / merged["stable_baseline"]
+        degrading_ratio_cols.append(col_name)
+
+    # Extra features: each stable gene relative to the stable baseline too
+    stable_ratio_cols = []
+    for gene in stable_cols:
+        col_name = f"{gene}_vs_stable"
+        merged[col_name] = merged[gene] / merged["stable_baseline"]
+        stable_ratio_cols.append(col_name)
+
+    def age_bracket_to_midpoint(bracket):
+        if pd.isna(bracket):
+            return np.nan
+        low, high = str(bracket).split("-")
+        return (int(low) + int(high)) / 2
+
+    merged["age_numeric"] = merged["AGE"].apply(age_bracket_to_midpoint)
+    merged["sex_numeric"] = merged["SEX"]
+
+    merged = merged.dropna(subset=["age_numeric", "sex_numeric"])
+
+    feature_cols = (
+        degrading_ratio_cols
+        + stable_ratio_cols
+        + ["stable_baseline", "age_numeric", "sex_numeric"]
+    )
 
     print(f"  -> {len(merged)} samples with complete features.")
     return merged, feature_cols
@@ -144,10 +206,20 @@ def train_and_evaluate(merged, feature_cols):
     X = merged[feature_cols]
     y = merged["ischemic_time_min"]
 
-    model = RandomForestRegressor(n_estimators=200, random_state=42)
+    y_log = np.log1p(y)
+
+    model = XGBRegressor(
+        n_estimators=300,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+    )
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
-    y_pred = cross_val_predict(model, X, y, cv=kf)
+    y_pred_log = cross_val_predict(model, X, y_log, cv=kf)
+    y_pred = np.expm1(y_pred_log)
 
     mae = mean_absolute_error(y, y_pred)
     r2 = r2_score(y, y_pred)
@@ -165,14 +237,15 @@ def train_and_evaluate(merged, feature_cols):
 
     save_scatter_plot_svg(y, y_pred)
 
-    model.fit(X, y)
+    model.fit(X, y_log)
     return model
 
 
 def main():
     meta_df = load_sample_metadata()
     expr_df = load_reference_gene_expression()
-    merged, feature_cols = build_features(expr_df, meta_df)
+    subject_df = load_subject_phenotypes()
+    merged, feature_cols = build_features(expr_df, meta_df, subject_df)
     train_and_evaluate(merged, feature_cols)
 
 
