@@ -22,7 +22,7 @@ SAMPLE_ATTRIBUTES_PATH = "data/raw/rna/GTEx_Analysis_v8_Annotations_SampleAttrib
 SUBJECT_PHENOTYPES_PATH = "data/raw/rna/GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt"
 GENE_READS_PATH = "data/raw/rna/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_reads.gct.gz"
 
-TARGET_TISSUE = "Muscle - Skeletal"
+TARGET_TISSUE = "Whole Blood"
 
 # STABLE_GENES: shown to stay relatively constant after death (Penna et al.,
 # PMC3189726) - used as the normalizer/denominator.
@@ -45,6 +45,7 @@ def load_sample_metadata():
     df = df[["SAMPID", "SMTSISCH", "SMTSD"]].copy()
     df = df.rename(columns={"SMTSISCH": "ischemic_time_min", "SMTSD": "tissue"})
     df = df.dropna(subset=["ischemic_time_min"])
+    df = df[df["ischemic_time_min"] >= 0]
     print(f"  -> {len(df)} samples have a recorded ischemic time.")
 
     if TARGET_TISSUE is not None:
@@ -129,9 +130,12 @@ def build_features(expr_df, meta_df, subject_df):
         return (int(low) + int(high)) / 2
 
     merged["age_numeric"] = merged["AGE"].apply(age_bracket_to_midpoint)
-    merged["sex_numeric"] = merged["SEX"]
+    merged["sex_numeric"] = merged["SEX"]  # GTEx already codes this as 1/2
 
-    merged = merged.dropna(subset=["age_numeric", "sex_numeric"])
+    # Impute (fill in) missing age/sex instead of dropping those rows -
+    # this preserves sample size, which usually helps more than losing data.
+    merged["age_numeric"] = merged["age_numeric"].fillna(merged["age_numeric"].median())
+    merged["sex_numeric"] = merged["sex_numeric"].fillna(merged["sex_numeric"].mode()[0])
 
     feature_cols = (
         degrading_ratio_cols
