@@ -22,12 +22,10 @@ SAMPLE_ATTRIBUTES_PATH = "data/raw/rna/GTEx_Analysis_v8_Annotations_SampleAttrib
 SUBJECT_PHENOTYPES_PATH = "data/raw/rna/GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt"
 GENE_READS_PATH = "data/raw/rna/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_reads.gct.gz"
 
-TARGET_TISSUE = "Whole Blood"
+# Changed target tissue to Muscle - Skeletal for optimal PMI tracking
+TARGET_TISSUE = "Muscle - Skeletal"
 
-# STABLE_GENES: shown to stay relatively constant after death (Penna et al.,
-# PMC3189726) - used as the normalizer/denominator.
-# DEGRADING_GENES: shown to correlate with PMI in muscle tissue (Portela
-# et al., PLOS ONE, PMC3577908) - these carry the actual signal.
+# STABLE_GENES: shown to stay relatively constant after death (Penna et al., PMC3189726)
 STABLE_GENES = ["CYC1", "RPL13A", "EIF4A2", "B2M", "TOP1"]
 DEGRADING_GENES = ["ACTB", "GAPDH", "PPIA"]
 
@@ -42,11 +40,12 @@ REFERENCE_GENES = list(set(
 def load_sample_metadata():
     print("Loading sample metadata...")
     df = pd.read_csv(SAMPLE_ATTRIBUTES_PATH, sep="\t", low_memory=False)
-    df = df[["SAMPID", "SMTSISCH", "SMTSD"]].copy()
-    df = df.rename(columns={"SMTSISCH": "ischemic_time_min", "SMTSD": "tissue"})
-    df = df.dropna(subset=["ischemic_time_min"])
+    # Include SMRIN (RNA Integrity Number)
+    df = df[["SAMPID", "SMTSISCH", "SMTSD", "SMRIN"]].copy()
+    df = df.rename(columns={"SMTSISCH": "ischemic_time_min", "SMTSD": "tissue", "SMRIN": "rin"})
+    df = df.dropna(subset=["ischemic_time_min", "rin"])
     df = df[df["ischemic_time_min"] >= 0]
-    print(f"  -> {len(df)} samples have a recorded ischemic time.")
+    print(f"  -> {len(df)} samples have recorded ischemic time & RIN.")
 
     if TARGET_TISSUE is not None:
         df = df[df["tissue"] == TARGET_TISSUE]
@@ -83,7 +82,8 @@ def load_reference_gene_expression():
 def load_subject_phenotypes():
     print("Loading subject phenotype data...")
     df = pd.read_csv(SUBJECT_PHENOTYPES_PATH, sep="\t", low_memory=False)
-    df = df[["SUBJID", "SEX", "AGE"]].copy()
+    # Include DTHHRDY (Hardy death classification scale)
+    df = df[["SUBJID", "SEX", "AGE", "DTHHRDY"]].copy()
     return df
 
 
@@ -101,27 +101,22 @@ def build_features(expr_df, meta_df, subject_df):
 
     gene_cols = [g for g in REFERENCE_GENES if g in merged.columns]
     stable_cols = [g for g in STABLE_GENES if g in merged.columns]
-    degrading_cols = [g for g in DEGRADING_GENES if g in merged.columns]
 
+    # Convert gene expression counts to log2 scale
     for gene in gene_cols:
-        merged[gene] = np.log1p(merged[gene])
+        merged[gene] = np.log2(merged[gene] + 1)
 
-    # Stable baseline: average expression of genes known to hold steady
+    # Stable baseline: average expression of stable control genes in log space
     merged["stable_baseline"] = merged[stable_cols].mean(axis=1)
 
-    # Main signal: each degrading gene relative to the stable baseline
-    degrading_ratio_cols = []
-    for gene in degrading_cols:
-        col_name = f"{gene}_vs_stable"
-        merged[col_name] = merged[gene] / merged["stable_baseline"]
-        degrading_ratio_cols.append(col_name)
-
-    # Extra features: each stable gene relative to the stable baseline too
-    stable_ratio_cols = []
-    for gene in stable_cols:
-        col_name = f"{gene}_vs_stable"
-        merged[col_name] = merged[gene] / merged["stable_baseline"]
-        stable_ratio_cols.append(col_name)
+    # Main signal: compute pairwise log-ratios (SUBTRACTION in log-space)
+    # log(A/B) = log(A) - log(B)
+    ratio_cols = []
+    for gene in gene_cols:
+        if gene not in stable_cols:
+            col_name = f"{gene}_vs_stable"
+            merged[col_name] = merged[gene] - merged["stable_baseline"]
+            ratio_cols.append(col_name)
 
     def age_bracket_to_midpoint(bracket):
         if pd.isna(bracket):
@@ -130,17 +125,19 @@ def build_features(expr_df, meta_df, subject_df):
         return (int(low) + int(high)) / 2
 
     merged["age_numeric"] = merged["AGE"].apply(age_bracket_to_midpoint)
-    merged["sex_numeric"] = merged["SEX"]  # GTEx already codes this as 1/2
+    merged["sex_numeric"] = merged["SEX"]
+    merged["hardy"] = pd.to_numeric(merged["DTHHRDY"], errors='coerce')
 
-    # Impute (fill in) missing age/sex instead of dropping those rows -
-    # this preserves sample size, which usually helps more than losing data.
+    # Impute missing demographic/clinical values
     merged["age_numeric"] = merged["age_numeric"].fillna(merged["age_numeric"].median())
     merged["sex_numeric"] = merged["sex_numeric"].fillna(merged["sex_numeric"].mode()[0])
+    merged["hardy"] = merged["hardy"].fillna(merged["hardy"].median())
+    merged["rin"] = pd.to_numeric(merged["rin"], errors='coerce')
+    merged["rin"] = merged["rin"].fillna(merged["rin"].median())
 
     feature_cols = (
-        degrading_ratio_cols
-        + stable_ratio_cols
-        + ["stable_baseline", "age_numeric", "sex_numeric"]
+        ratio_cols
+        + ["stable_baseline", "age_numeric", "sex_numeric", "rin", "hardy"]
     )
 
     print(f"  -> {len(merged)} samples with complete features.")
@@ -176,25 +173,25 @@ def save_scatter_plot_svg(y_actual, y_predicted, out_path="reports/rna_model_pre
 
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"
      viewBox="0 0 {width} {height}" font-family="Arial, sans-serif">
-  <rect width="{width}" height="{height}" fill="white" />
-  <text x="{width/2}" y="30" text-anchor="middle" font-size="18" font-weight="bold">
-    RNA Model: Predicted vs Actual PMI
-  </text>
-  <line x1="{margin}" y1="{height-margin}" x2="{width-margin}" y2="{height-margin}"
-        stroke="black" stroke-width="1" />
-  <line x1="{margin}" y1="{margin}" x2="{margin}" y2="{height-margin}"
-        stroke="black" stroke-width="1" />
-  <text x="{width/2}" y="{height-15}" text-anchor="middle" font-size="13">
-    Actual ischemic time (minutes)
-  </text>
-  <text x="20" y="{height/2}" text-anchor="middle" font-size="13"
-        transform="rotate(-90, 20, {height/2})">
-    Predicted ischemic time (minutes)
-  </text>
-  <line x1="{line_x1:.1f}" y1="{line_y1:.1f}" x2="{line_x2:.1f}" y2="{line_y2:.1f}"
-        stroke="red" stroke-width="1.5" stroke-dasharray="6,4" />
-  {circles}
-</svg>'''
+   <rect width="{width}" height="{height}" fill="white" />
+   <text x="{width/2}" y="30" text-anchor="middle" font-size="18" font-weight="bold">
+     RNA Model: Predicted vs Actual PMI
+   </text>
+   <line x1="{margin}" y1="{height-margin}" x2="{width-margin}" y2="{height-margin}"
+         stroke="black" stroke-width="1" />
+   <line x1="{margin}" y1="{margin}" x2="{margin}" y2="{height-margin}"
+         stroke="black" stroke-width="1" />
+   <text x="{width/2}" y="{height-15}" text-anchor="middle" font-size="13">
+     Actual ischemic time (minutes)
+   </text>
+   <text x="20" y="{height/2}" text-anchor="middle" font-size="13"
+         transform="rotate(-90, 20, {height/2})">
+     Predicted ischemic time (minutes)
+   </text>
+   <line x1="{line_x1:.1f}" y1="{line_y1:.1f}" x2="{line_x2:.1f}" y2="{line_y2:.1f}"
+         stroke="red" stroke-width="1.5" stroke-dasharray="6,4" />
+   {circles}
+ </svg>'''
 
     import os
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -210,20 +207,24 @@ def train_and_evaluate(merged, feature_cols):
     X = merged[feature_cols]
     y = merged["ischemic_time_min"]
 
-    y_log = np.log1p(y)
+    # Target log-transform to handle right skew
+    y_log = np.log2(y + 1)
 
     model = XGBRegressor(
-        n_estimators=300,
+        n_estimators=200,
         max_depth=4,
-        learning_rate=0.05,
+        learning_rate=0.04,
         subsample=0.8,
         colsample_bytree=0.8,
+        reg_alpha=0.5,
+        reg_lambda=1.5,
         random_state=42,
     )
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
+    # Perform Cross-Validation
     y_pred_log = cross_val_predict(model, X, y_log, cv=kf)
-    y_pred = np.expm1(y_pred_log)
+    y_pred = np.clip(2**y_pred_log - 1, 0, None)
 
     mae = mean_absolute_error(y, y_pred)
     r2 = r2_score(y, y_pred)
@@ -234,7 +235,7 @@ def train_and_evaluate(merged, feature_cols):
 
     print("\n--- RESULTS ---")
     print(f"Our model's Mean Absolute Error : {mae:.2f} minutes ({mae/60:.2f} hours)")
-    print(f"R^2 score                       : {r2:.3f}  (closer to 1 = better)")
+    print(f"R^2 score                       : {r2:.4f}  (closer to 1 = better)")
     print(f"Baseline (always guess average) : {baseline_mae:.2f} minutes ({baseline_mae/60:.2f} hours)")
     improvement = (1 - mae / baseline_mae) * 100
     print(f"Improvement over baseline        : {improvement:.1f}%")
