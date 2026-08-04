@@ -6,6 +6,8 @@ Trains a unified multi-tissue model across GTEx tissue samples and reports:
   2. Overall Sample-Level R² & MAE
   3. Donor-Averaged Ensemble R² & MAE
 
+Then trains and saves a final deployable model on all data.
+
 Methodological Integrity:
   - Strict 5-Fold Donor GroupKFold Cross-Validation (Zero intra-donor leakage)
   - In-fold pairwise log-ratio decay kinetics log2(Degrading / Reference)
@@ -14,6 +16,7 @@ Methodological Integrity:
 
 import os
 import gzip
+import pickle
 import numpy as np
 import pandas as pd
 
@@ -286,7 +289,7 @@ def train_and_evaluate(sa, expr):
     print("=" * 60)
     print(f"  {'Tissue Type':<35} | {'Samples':<8} | {'R²':<7} | {'MAE (hrs)':<10}")
     print("-" * 65)
-    
+
     for t in TARGET_TISSUES:
         t_sub = df_eval[df_eval["tissue"] == t]
         if len(t_sub) > 5:
@@ -341,9 +344,92 @@ def _save_scatter(y_actual, y_pred, r2, mae, out_dir="reports"):
     plt.close(fig)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. FINAL DEPLOYABLE MODEL (trained on ALL data, saved for later reuse)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def train_final_model_and_save(sa, expr, out_path="models/rna_model.pkl"):
+    """
+    Trains one FINAL model on ALL available data for deployment.
+    Cross-validation (train_and_evaluate, above) already established the
+    honest accuracy numbers. This final fit just produces a usable model
+    for the meta-model / fusion step to load later.
+    """
+    print("\nTraining final model on all data for deployment...")
+
+    y_all = sa["time"].values
+    tissue_oh = pd.get_dummies(sa["tissue"])
+    tissue_columns = tissue_oh.columns.tolist()
+
+    clin_feats = np.column_stack([
+        sa["rin"].values, sa["rin"].values ** 2, sa["autolysis"].values,
+        sa["age"].values, sa["sex"].values, sa["hardy"].values,
+    ])
+
+    raw_G = expr.loc[sa["SAMPID"]].values.astype(np.float64)
+    top_gene_idx = np.argsort(raw_G.var(axis=0))[-N_VAR_GENES:]
+    G_log = np.log2(raw_G[:, top_gene_idx] + 1.0)
+
+    corrs = np.array([
+        np.corrcoef(G_log[:, i], y_all)[0, 1] if G_log[:, i].std() > 0 else 0.0
+        for i in range(G_log.shape[1])
+    ])
+    corrs = np.nan_to_num(corrs)
+    deg_idx = np.argsort(corrs)[:N_DEGRADERS]
+    sta_idx = np.argsort(np.abs(corrs))[:N_STABLE]
+
+    def make_ratios(G):
+        return np.column_stack([G[:, d] - G[:, s] for d in deg_idx for s in sta_idx])
+
+    R = make_ratios(G_log)
+    scaler = NumpyRobustScaler()
+    R_scaled = scaler.fit_transform(R)
+    pca = NumpyPCA(n_components=N_PCA)
+    P = pca.fit_transform(R_scaled)
+
+    S = np.column_stack([R.mean(axis=1), R.std(axis=1), G_log[:, deg_idx].mean(axis=1)])
+
+    X_final = np.hstack([P, S, tissue_oh.values.astype(np.float64), clin_feats])
+    y_log = np.log2(y_all + 1.0)
+
+    if HAS_XGB:
+        final_model = xgb.train(
+            {"max_depth": 5, "eta": 0.025, "subsample": 0.85,
+             "colsample_bytree": 0.75, "alpha": 0.3, "lambda": 1.0,
+             "objective": "reg:squarederror", "seed": 42, "verbosity": 0},
+            xgb.DMatrix(X_final, label=y_log),
+            num_boost_round=450,
+        )
+    else:
+        final_model = NumpyRidgeEnsemble(alpha=4.0)
+        final_model.fit(X_final, y_log)
+
+    os.makedirs("models", exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump({
+            "model": final_model,
+            "top_gene_idx": top_gene_idx,
+            "deg_idx": deg_idx,
+            "sta_idx": sta_idx,
+            "scaler_center": scaler.center_,
+            "scaler_scale": scaler.scale_,
+            "pca_mean": pca.mean_,
+            "pca_components": pca.components_,
+            "tissue_columns": tissue_columns,
+            "gene_names": expr.columns[top_gene_idx].tolist(),
+        }, f)
+
+    print(f"  -> Final deployment model saved to {out_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def main():
     sa, expr = load_data()
-    train_and_evaluate(sa, expr)
+    train_and_evaluate(sa, expr)           # Phase 1: Honest CV evaluation
+    train_final_model_and_save(sa, expr)   # Phase 2: Save deployment model
 
 
 if __name__ == "__main__":
