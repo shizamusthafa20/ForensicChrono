@@ -1,2 +1,4 @@
 timestamp,n_donors,donor_r2,donor_mae_hrs,baseline_mae_hrs,improvement_pct,muscle_r2,muscle_mae_hrs,lung_r2,lung_mae_hrs,skin_r2,skin_mae_hrs,nerve_r2,nerve_mae_hrs,n_var_genes,cv_strategy
 20260805_130945,836,0.6142,2.46,4.55,45.9,0.5614,2.54,0.661,2.48,0.5457,2.64,0.553,2.47,1200,stratified_group_kfold
+20260805_205115,836,0.6303,2.41,4.55,47.1,0.5694,2.51,0.6764,2.4,0.544,2.65,0.5822,2.41,1200,standard_5fold_group_kfold
+20260805_213132,RandomForest,836,0.6087,2.46,4.55,45.8,0.5615,2.53,0.6726,2.45,0.5515,2.6,0.5737,2.43,1200,standard_5fold_group_kfold

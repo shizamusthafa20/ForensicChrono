@@ -1,7 +1,7 @@
 """
-rna_model.py  ──  ForensicChrono (Multi-Tissue Model with Per-Tissue Logging & Deployment)
-===========================================================================================
-Trains a unified multi-tissue model across GTEx tissue samples and reports:
+rna_model.py  ──  ForensicChrono (Multi-Tissue Model with Pure Random Forest)
+=============================================================================
+Trains a standalone Random Forest Regressor across GTEx tissue samples:
   1. Per-Tissue R² & MAE (Muscle-only, Lung-only, Skin-only, Nerve-only)
   2. Overall Sample-Level R² & MAE
   3. Donor-Averaged Ensemble R² & MAE
@@ -9,8 +9,7 @@ Trains a unified multi-tissue model across GTEx tissue samples and reports:
   5. Final deployment model saving to models/rna_model.pkl
 
 Methodological Integrity:
-  - Strict 5-Fold STRATIFIED Donor GroupKFold Cross-Validation
-    (Zero intra-donor leakage + balanced PMI distribution across folds)
+  - Standard 5-Fold Donor GroupKFold CV (Zero intra-donor leakage)
   - In-fold pairwise log-ratio decay kinetics log2(Degrading / Reference)
   - Zero hardcoded numbers, zero synthetic formulas, zero code cheats
 """
@@ -27,11 +26,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-try:
-    import xgboost as xgb
-    HAS_XGB = True
-except ImportError:
-    HAS_XGB = False
+from sklearn.ensemble import RandomForestRegressor
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 SAMPLE_ATTR_PATH   = "data/raw/rna/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
@@ -93,31 +88,13 @@ class NumpyPCA:
         return res
 
 
-def numpy_stratified_group_kfold(groups, y, n_splits=5, n_bins=4, seed=42):
-    """
-    Stratified + Grouped K-Fold in pure NumPy.
-    - GROUPED: all samples from the same donor stay in one fold (zero leakage)
-    - STRATIFIED: donors are binned by their average PMI level (quartiles)
-      and distributed evenly across folds so each fold gets balanced PMI ranges.
-    """
+def numpy_standard_group_kfold(groups, n_splits=5, seed=42):
+    """Standard 5-Fold GroupKFold splitting in pure NumPy."""
     unique_groups = np.unique(groups)
-    donor_y = np.array([y[groups == g].mean() for g in unique_groups])
-
-    n_bins = min(n_bins, len(unique_groups))
-    bin_edges = np.quantile(donor_y, np.linspace(0, 1, n_bins + 1))
-    bin_edges[-1] += 1e-6
-    donor_bins = np.digitize(donor_y, bin_edges[1:-1])
-
     rng = np.random.RandomState(seed)
-    fold_assignment = np.zeros(len(unique_groups), dtype=int)
-
-    for b in range(n_bins):
-        idx_in_bin = np.where(donor_bins == b)[0]
-        rng.shuffle(idx_in_bin)
-        fold_assignment[idx_in_bin] = np.arange(len(idx_in_bin)) % n_splits
-
-    for fold in range(n_splits):
-        val_groups = unique_groups[fold_assignment == fold]
+    rng.shuffle(unique_groups)
+    splits = np.array_split(unique_groups, n_splits)
+    for val_groups in splits:
         val_mask = np.isin(groups, val_groups)
         tr_idx = np.where(~val_mask)[0]
         val_idx = np.where(val_mask)[0]
@@ -134,24 +111,8 @@ def compute_mae(y_true, y_pred):
     return np.mean(np.abs(y_true - y_pred))
 
 
-class NumpyRidgeEnsemble:
-    def __init__(self, alpha=4.0):
-        self.alpha = alpha
-
-    def fit(self, X, y):
-        n_samples, n_features = X.shape
-        X_b = np.hstack([np.ones((n_samples, 1)), X])
-        I = np.eye(n_features + 1)
-        I[0, 0] = 0.0
-        self.w = np.linalg.solve(X_b.T @ X_b + self.alpha * I, X_b.T @ y)
-
-    def predict(self, X):
-        X_b = np.hstack([np.ones((X.shape[0], 1)), X])
-        return X_b @ self.w
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
-# 1. EXPERIMENT LOGGING SYSTEM (Includes Per-Tissue Excel Columns + Error Protection)
+# 1. EXPERIMENT LOGGING SYSTEM
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def log_experiment_results(per_tissue_results, donor_r2, donor_mae, baseline_mae,
@@ -159,13 +120,14 @@ def log_experiment_results(per_tissue_results, donor_r2, donor_mae, baseline_mae
     """
     Saves this run's results to a folder:
     - Detailed JSON file per run: results/run_YYYYMMDD_HHMMSS.json
-    - Running summary CSV file: results/experiment_summary.csv (with Per-Tissue R² & MAE columns)
+    - Running summary CSV file: results/experiment_summary.csv (with Per-Tissue columns)
     """
     os.makedirs(out_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     result_record = {
         "timestamp": timestamp,
+        "model_type": "RandomForestRegressor",
         "config": {
             "target_tissues": TARGET_TISSUES,
             "max_time_min": MAX_TIME_MIN,
@@ -173,7 +135,7 @@ def log_experiment_results(per_tissue_results, donor_r2, donor_mae, baseline_mae
             "n_degraders": N_DEGRADERS,
             "n_stable": N_STABLE,
             "n_pca": N_PCA,
-            "cv_strategy": "stratified_group_kfold",
+            "cv_strategy": "standard_5fold_group_kfold",
         },
         "per_tissue_results": per_tissue_results,
         "donor_r2": float(donor_r2),
@@ -193,6 +155,7 @@ def log_experiment_results(per_tissue_results, donor_r2, donor_mae, baseline_mae
 
     summary_dict = {
         "timestamp": timestamp,
+        "model_type": "RandomForest",
         "n_donors": n_donors,
         "donor_r2": round(float(donor_r2), 4),
         "donor_mae_hrs": round(float(donor_mae) / 60.0, 2),
@@ -200,7 +163,6 @@ def log_experiment_results(per_tissue_results, donor_r2, donor_mae, baseline_mae
         "improvement_pct": round(float(improvement), 1),
     }
 
-    # Add Per-Tissue R² and MAE columns directly to CSV
     for t in TARGET_TISSUES:
         t_key = t.split(" - ")[0].lower().replace(" ", "_")
         if t in per_tissue_results:
@@ -211,13 +173,13 @@ def log_experiment_results(per_tissue_results, donor_r2, donor_mae, baseline_mae
             summary_dict[f"{t_key}_mae_hrs"] = None
 
     summary_dict["n_var_genes"] = N_VAR_GENES
-    summary_dict["cv_strategy"] = "stratified_group_kfold"
+    summary_dict["cv_strategy"] = "standard_5fold_group_kfold"
 
     summary_row = pd.DataFrame([summary_dict])
 
     try:
         summary_row.to_csv(csv_path, mode="a", header=not file_exists, index=False)
-        print(f"  Summary with Per-Tissue columns appended → {csv_path}")
+        print(f"  Appended CSV row with Per-Tissue columns → {csv_path}")
     except PermissionError:
         print(f"\n  [NOTE] Could not update '{csv_path}' because it is currently open in Excel.")
         print(f"         Close Excel if you want future runs appended to the CSV.")
@@ -280,7 +242,7 @@ def load_data():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. IN-FOLD FEATURE EXTRACTION & CV
+# 3. IN-FOLD FEATURE EXTRACTION & RANDOM FOREST CV
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_in_fold_features(G_tr, G_val, y_tr):
@@ -335,9 +297,9 @@ def train_and_evaluate(sa, expr):
     y_log = np.log2(y_all + 1.0)
     sample_y_pred = np.zeros(n_samples)
 
-    print("\nRunning 5-Fold STRATIFIED Donor GroupKFold CV...")
+    print("\nRunning Standard 5-Fold Donor GroupKFold CV (Random Forest Regressor)...")
 
-    for fold, (tr_idx, val_idx) in enumerate(numpy_stratified_group_kfold(groups_all, y_all, n_splits=5), 1):
+    for fold, (tr_idx, val_idx) in enumerate(numpy_standard_group_kfold(groups_all, n_splits=5), 1):
         G_tr, G_val = G_log[tr_idx], G_log[val_idx]
         y_tr = y_all[tr_idx]
 
@@ -346,26 +308,15 @@ def train_and_evaluate(sa, expr):
         X_tr = np.hstack([feat_tr, tissue_oh[tr_idx], clin_feats[tr_idx]])
         X_val = np.hstack([feat_val, tissue_oh[val_idx], clin_feats[val_idx]])
 
-        if HAS_XGB:
-            dtrain = xgb.DMatrix(X_tr, label=y_log[tr_idx])
-            dval = xgb.DMatrix(X_val)
-            params = {
-                "max_depth": 5,
-                "eta": 0.025,
-                "subsample": 0.85,
-                "colsample_bytree": 0.75,
-                "alpha": 0.3,
-                "lambda": 1.0,
-                "objective": "reg:squarederror",
-                "seed": 42,
-                "verbosity": 0,
-            }
-            bst = xgb.train(params, dtrain, num_boost_round=450)
-            pred_log = bst.predict(dval)
-        else:
-            ridge = NumpyRidgeEnsemble(alpha=4.0)
-            ridge.fit(X_tr, y_log[tr_idx])
-            pred_log = ridge.predict(X_val)
+        rf = RandomForestRegressor(
+            n_estimators=300,
+            max_depth=10,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1,
+        )
+        rf.fit(X_tr, y_log[tr_idx])
+        pred_log = rf.predict(X_val)
 
         sample_y_pred[val_idx] = np.clip(2.0 ** pred_log - 1.0, 0.0, None)
         print(f"  Fold {fold}/5 completed.")
@@ -418,7 +369,7 @@ def train_and_evaluate(sa, expr):
 
     _save_scatter(donor_eval["y_true"].values, donor_eval["y_pred"].values, r2_donor, mae_donor)
 
-    # Log experiment results
+    # Log experiment results to results/
     log_experiment_results(per_tissue_results, r2_donor, mae_donor, baseline_mae,
                            improvement, len(donor_eval))
 
@@ -437,7 +388,7 @@ def _save_scatter(y_actual, y_pred, r2, mae, out_dir="reports"):
 
     ax.set_xlabel("Actual Donor Ischemic Time (minutes)", fontsize=12)
     ax.set_ylabel("Predicted Donor Ischemic Time (minutes)", fontsize=12)
-    ax.set_title("Multi-Tissue PMI Model (Per-Tissue & Donor Evaluation)\n(GTEx v8 Donor-Level Ensemble, 5-Fold Stratified Donor GroupKFold)", fontsize=11)
+    ax.set_title("Multi-Tissue PMI Model (Random Forest Regressor)\n(GTEx v8 Donor-Level Ensemble, Standard 5-Fold Donor GroupKFold)", fontsize=11)
     ax.legend(fontsize=10, loc="lower right")
     ax.grid(True, linestyle="--", alpha=0.4)
     plt.tight_layout()
@@ -454,7 +405,7 @@ def _save_scatter(y_actual, y_pred, r2, mae, out_dir="reports"):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def train_final_model_and_save(sa, expr, out_path="models/rna_model.pkl"):
-    print("\nTraining final model on all data for deployment...")
+    print("\nTraining final deployment model on all data...")
 
     y_all = sa["time"].values
     tissue_oh = pd.get_dummies(sa["tissue"])
@@ -491,22 +442,15 @@ def train_final_model_and_save(sa, expr, out_path="models/rna_model.pkl"):
     X_final = np.hstack([P, S, tissue_oh.values.astype(np.float64), clin_feats])
     y_log = np.log2(y_all + 1.0)
 
-    if HAS_XGB:
-        final_model = xgb.train(
-            {"max_depth": 5, "eta": 0.025, "subsample": 0.85,
-             "colsample_bytree": 0.75, "alpha": 0.3, "lambda": 1.0,
-             "objective": "reg:squarederror", "seed": 42, "verbosity": 0},
-            xgb.DMatrix(X_final, label=y_log),
-            num_boost_round=450,
-        )
-    else:
-        final_model = NumpyRidgeEnsemble(alpha=4.0)
-        final_model.fit(X_final, y_log)
+    rf_final = RandomForestRegressor(
+        n_estimators=300, max_depth=10, min_samples_leaf=2, random_state=42, n_jobs=-1
+    )
+    rf_final.fit(X_final, y_log)
 
     os.makedirs("models", exist_ok=True)
     with open(out_path, "wb") as f:
         pickle.dump({
-            "model": final_model,
+            "model": rf_final,
             "top_gene_idx": top_gene_idx,
             "deg_idx": deg_idx,
             "sta_idx": sta_idx,
@@ -527,8 +471,8 @@ def train_final_model_and_save(sa, expr, out_path="models/rna_model.pkl"):
 
 def main():
     sa, expr = load_data()
-    train_and_evaluate(sa, expr)           # Phase 1: Stratified CV & Per-Tissue CSV Logging
-    train_final_model_and_save(sa, expr)   # Phase 2: Save deployment model
+    train_and_evaluate(sa, expr)           # Standard 5-Fold Donor GroupKFold CV with Random Forest
+    train_final_model_and_save(sa, expr)   # Save deployment model
 
 
 if __name__ == "__main__":
