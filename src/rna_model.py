@@ -1,22 +1,25 @@
 """
-rna_model.py  ──  ForensicChrono (Multi-Tissue Model with Per-Tissue Evaluation)
-================================================================================
+rna_model.py  ──  ForensicChrono (Multi-Tissue Model with Per-Tissue Logging & Deployment)
+===========================================================================================
 Trains a unified multi-tissue model across GTEx tissue samples and reports:
   1. Per-Tissue R² & MAE (Muscle-only, Lung-only, Skin-only, Nerve-only)
   2. Overall Sample-Level R² & MAE
   3. Donor-Averaged Ensemble R² & MAE
-
-Then trains and saves a final deployable model on all data.
+  4. Experiment logging to results/ (JSON + CSV with Per-Tissue Columns)
+  5. Final deployment model saving to models/rna_model.pkl
 
 Methodological Integrity:
-  - Strict 5-Fold Donor GroupKFold Cross-Validation (Zero intra-donor leakage)
+  - Strict 5-Fold STRATIFIED Donor GroupKFold Cross-Validation
+    (Zero intra-donor leakage + balanced PMI distribution across folds)
   - In-fold pairwise log-ratio decay kinetics log2(Degrading / Reference)
   - Zero hardcoded numbers, zero synthetic formulas, zero code cheats
 """
 
 import os
 import gzip
+import json
 import pickle
+from datetime import datetime
 import numpy as np
 import pandas as pd
 
@@ -90,12 +93,31 @@ class NumpyPCA:
         return res
 
 
-def numpy_group_kfold(groups, n_splits=5, seed=42):
+def numpy_stratified_group_kfold(groups, y, n_splits=5, n_bins=4, seed=42):
+    """
+    Stratified + Grouped K-Fold in pure NumPy.
+    - GROUPED: all samples from the same donor stay in one fold (zero leakage)
+    - STRATIFIED: donors are binned by their average PMI level (quartiles)
+      and distributed evenly across folds so each fold gets balanced PMI ranges.
+    """
     unique_groups = np.unique(groups)
+    donor_y = np.array([y[groups == g].mean() for g in unique_groups])
+
+    n_bins = min(n_bins, len(unique_groups))
+    bin_edges = np.quantile(donor_y, np.linspace(0, 1, n_bins + 1))
+    bin_edges[-1] += 1e-6
+    donor_bins = np.digitize(donor_y, bin_edges[1:-1])
+
     rng = np.random.RandomState(seed)
-    rng.shuffle(unique_groups)
-    splits = np.array_split(unique_groups, n_splits)
-    for val_groups in splits:
+    fold_assignment = np.zeros(len(unique_groups), dtype=int)
+
+    for b in range(n_bins):
+        idx_in_bin = np.where(donor_bins == b)[0]
+        rng.shuffle(idx_in_bin)
+        fold_assignment[idx_in_bin] = np.arange(len(idx_in_bin)) % n_splits
+
+    for fold in range(n_splits):
+        val_groups = unique_groups[fold_assignment == fold]
         val_mask = np.isin(groups, val_groups)
         tr_idx = np.where(~val_mask)[0]
         val_idx = np.where(val_mask)[0]
@@ -129,7 +151,80 @@ class NumpyRidgeEnsemble:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 1. METADATA LOADING & EXPRESSION ASSEMBLY
+# 1. EXPERIMENT LOGGING SYSTEM (Includes Per-Tissue Excel Columns + Error Protection)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def log_experiment_results(per_tissue_results, donor_r2, donor_mae, baseline_mae,
+                           improvement, n_donors, out_dir="results"):
+    """
+    Saves this run's results to a folder:
+    - Detailed JSON file per run: results/run_YYYYMMDD_HHMMSS.json
+    - Running summary CSV file: results/experiment_summary.csv (with Per-Tissue R² & MAE columns)
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    result_record = {
+        "timestamp": timestamp,
+        "config": {
+            "target_tissues": TARGET_TISSUES,
+            "max_time_min": MAX_TIME_MIN,
+            "n_var_genes": N_VAR_GENES,
+            "n_degraders": N_DEGRADERS,
+            "n_stable": N_STABLE,
+            "n_pca": N_PCA,
+            "cv_strategy": "stratified_group_kfold",
+        },
+        "per_tissue_results": per_tissue_results,
+        "donor_r2": float(donor_r2),
+        "donor_mae_min": float(donor_mae),
+        "baseline_mae_min": float(baseline_mae),
+        "improvement_pct": float(improvement),
+        "n_donors": int(n_donors),
+    }
+
+    json_path = os.path.join(out_dir, f"run_{timestamp}.json")
+    with open(json_path, "w") as f:
+        json.dump(result_record, f, indent=2)
+    print(f"\n  Experiment log saved → {json_path}")
+
+    csv_path = os.path.join(out_dir, "experiment_summary.csv")
+    file_exists = os.path.exists(csv_path)
+
+    summary_dict = {
+        "timestamp": timestamp,
+        "n_donors": n_donors,
+        "donor_r2": round(float(donor_r2), 4),
+        "donor_mae_hrs": round(float(donor_mae) / 60.0, 2),
+        "baseline_mae_hrs": round(float(baseline_mae) / 60.0, 2),
+        "improvement_pct": round(float(improvement), 1),
+    }
+
+    # Add Per-Tissue R² and MAE columns directly to CSV
+    for t in TARGET_TISSUES:
+        t_key = t.split(" - ")[0].lower().replace(" ", "_")
+        if t in per_tissue_results:
+            summary_dict[f"{t_key}_r2"] = per_tissue_results[t]["r2"]
+            summary_dict[f"{t_key}_mae_hrs"] = per_tissue_results[t]["mae_hrs"]
+        else:
+            summary_dict[f"{t_key}_r2"] = None
+            summary_dict[f"{t_key}_mae_hrs"] = None
+
+    summary_dict["n_var_genes"] = N_VAR_GENES
+    summary_dict["cv_strategy"] = "stratified_group_kfold"
+
+    summary_row = pd.DataFrame([summary_dict])
+
+    try:
+        summary_row.to_csv(csv_path, mode="a", header=not file_exists, index=False)
+        print(f"  Summary with Per-Tissue columns appended → {csv_path}")
+    except PermissionError:
+        print(f"\n  [NOTE] Could not update '{csv_path}' because it is currently open in Excel.")
+        print(f"         Close Excel if you want future runs appended to the CSV.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. METADATA LOADING & EXPRESSION ASSEMBLY
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_data():
@@ -185,7 +280,7 @@ def load_data():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2. IN-FOLD FEATURE EXTRACTION & CV
+# 3. IN-FOLD FEATURE EXTRACTION & CV
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_in_fold_features(G_tr, G_val, y_tr):
@@ -240,9 +335,9 @@ def train_and_evaluate(sa, expr):
     y_log = np.log2(y_all + 1.0)
     sample_y_pred = np.zeros(n_samples)
 
-    print("\nRunning 5-Fold Donor GroupKFold CV...")
+    print("\nRunning 5-Fold STRATIFIED Donor GroupKFold CV...")
 
-    for fold, (tr_idx, val_idx) in enumerate(numpy_group_kfold(groups_all, n_splits=5), 1):
+    for fold, (tr_idx, val_idx) in enumerate(numpy_stratified_group_kfold(groups_all, y_all, n_splits=5), 1):
         G_tr, G_val = G_log[tr_idx], G_log[val_idx]
         y_tr = y_all[tr_idx]
 
@@ -290,12 +385,18 @@ def train_and_evaluate(sa, expr):
     print(f"  {'Tissue Type':<35} | {'Samples':<8} | {'R²':<7} | {'MAE (hrs)':<10}")
     print("-" * 65)
 
+    per_tissue_results = {}
     for t in TARGET_TISSUES:
         t_sub = df_eval[df_eval["tissue"] == t]
         if len(t_sub) > 5:
             r2_t = compute_r2(t_sub["y_true"].values, t_sub["y_pred"].values)
             mae_t = compute_mae(t_sub["y_true"].values, t_sub["y_pred"].values)
             print(f"  {t:<35} | {len(t_sub):<8} | {r2_t:<7.4f} | {mae_t/60:<10.2f} hrs")
+            per_tissue_results[t] = {
+                "n_samples": len(t_sub),
+                "r2": round(float(r2_t), 4),
+                "mae_hrs": round(float(mae_t) / 60.0, 2),
+            }
     print("=" * 65)
 
     # ── 2. DONOR-LEVEL ENSEMBLE ACCURACY ──
@@ -317,6 +418,10 @@ def train_and_evaluate(sa, expr):
 
     _save_scatter(donor_eval["y_true"].values, donor_eval["y_pred"].values, r2_donor, mae_donor)
 
+    # Log experiment results
+    log_experiment_results(per_tissue_results, r2_donor, mae_donor, baseline_mae,
+                           improvement, len(donor_eval))
+
 
 def _save_scatter(y_actual, y_pred, r2, mae, out_dir="reports"):
     os.makedirs(out_dir, exist_ok=True)
@@ -332,7 +437,7 @@ def _save_scatter(y_actual, y_pred, r2, mae, out_dir="reports"):
 
     ax.set_xlabel("Actual Donor Ischemic Time (minutes)", fontsize=12)
     ax.set_ylabel("Predicted Donor Ischemic Time (minutes)", fontsize=12)
-    ax.set_title("Multi-Tissue PMI Model (Per-Tissue & Donor Evaluation)\n(GTEx v8 Donor-Level Ensemble, 5-Fold Donor GroupKFold)", fontsize=11)
+    ax.set_title("Multi-Tissue PMI Model (Per-Tissue & Donor Evaluation)\n(GTEx v8 Donor-Level Ensemble, 5-Fold Stratified Donor GroupKFold)", fontsize=11)
     ax.legend(fontsize=10, loc="lower right")
     ax.grid(True, linestyle="--", alpha=0.4)
     plt.tight_layout()
@@ -345,16 +450,10 @@ def _save_scatter(y_actual, y_pred, r2, mae, out_dir="reports"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. FINAL DEPLOYABLE MODEL (trained on ALL data, saved for later reuse)
+# 4. FINAL DEPLOYABLE MODEL SAVING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def train_final_model_and_save(sa, expr, out_path="models/rna_model.pkl"):
-    """
-    Trains one FINAL model on ALL available data for deployment.
-    Cross-validation (train_and_evaluate, above) already established the
-    honest accuracy numbers. This final fit just produces a usable model
-    for the meta-model / fusion step to load later.
-    """
     print("\nTraining final model on all data for deployment...")
 
     y_all = sa["time"].values
@@ -423,12 +522,12 @@ def train_final_model_and_save(sa, expr, out_path="models/rna_model.pkl"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. MAIN
+# 5. MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     sa, expr = load_data()
-    train_and_evaluate(sa, expr)           # Phase 1: Honest CV evaluation
+    train_and_evaluate(sa, expr)           # Phase 1: Stratified CV & Per-Tissue CSV Logging
     train_final_model_and_save(sa, expr)   # Phase 2: Save deployment model
 
 

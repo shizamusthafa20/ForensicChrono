@@ -1,0 +1,2 @@
+timestamp,n_donors,donor_r2,donor_mae_hrs,baseline_mae_hrs,improvement_pct,muscle_r2,muscle_mae_hrs,lung_r2,lung_mae_hrs,skin_r2,skin_mae_hrs,nerve_r2,nerve_mae_hrs,n_var_genes,cv_strategy
+20260805_130945,836,0.6142,2.46,4.55,45.9,0.5614,2.54,0.661,2.48,0.5457,2.64,0.553,2.47,1200,stratified_group_kfold
