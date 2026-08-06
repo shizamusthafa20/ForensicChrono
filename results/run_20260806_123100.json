@@ -1,0 +1,47 @@
+{
+  "timestamp": "20260806_123100",
+  "model_type": "StackingEnsemble",
+  "config": {
+    "target_tissues": [
+      "Muscle - Skeletal",
+      "Lung",
+      "Skin - Sun Exposed (Lower leg)",
+      "Nerve - Tibial"
+    ],
+    "max_time_min": 1200,
+    "exclude_hardy_0": true,
+    "n_var_genes": 1500,
+    "n_degraders": 50,
+    "n_stable": 15,
+    "n_pca": 20,
+    "cv_strategy": "standard_5fold_group_kfold",
+    "stacking": "XGBoost + RandomForest + Ridge \u2192 Ridge Meta-Learner"
+  },
+  "per_tissue_results": {
+    "Muscle - Skeletal": {
+      "n_samples": 321,
+      "r2": -0.0645,
+      "mae_hrs": 3.4
+    },
+    "Lung": {
+      "n_samples": 237,
+      "r2": -0.0401,
+      "mae_hrs": 3.06
+    },
+    "Skin - Sun Exposed (Lower leg)": {
+      "n_samples": 294,
+      "r2": -0.0007,
+      "mae_hrs": 3.4
+    },
+    "Nerve - Tibial": {
+      "n_samples": 242,
+      "r2": 0.1318,
+      "mae_hrs": 3.08
+    }
+  },
+  "donor_r2": 0.14521938867581663,
+  "donor_mae_min": 189.88908982846573,
+  "baseline_mae_min": 198.630024348673,
+  "improvement_pct": 4.400610909085689,
+  "n_donors": 370
+}
