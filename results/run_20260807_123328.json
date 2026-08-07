@@ -1,0 +1,51 @@
+{
+  "timestamp": "20260807_123328",
+  "model_type": "StackingEnsemble_0to12h",
+  "config": {
+    "target_tissues": [
+      "Muscle - Skeletal",
+      "Lung",
+      "Skin - Sun Exposed (Lower leg)",
+      "Nerve - Tibial"
+    ],
+    "max_time_min": 720,
+    "n_var_genes": 1200,
+    "n_degraders": 35,
+    "n_stable": 12,
+    "n_pca": 15,
+    "cv_strategy": "standard_5fold_group_kfold"
+  },
+  "individual_model_r2": {
+    "XGBoost": 0.4917,
+    "RandomForest": 0.468,
+    "Ridge": 0.3948,
+    "STACKED": 0.4779
+  },
+  "per_tissue_results": {
+    "Muscle - Skeletal": {
+      "n_samples": 503,
+      "r2": 0.3975,
+      "mae_hrs": 1.69
+    },
+    "Lung": {
+      "n_samples": 366,
+      "r2": 0.5335,
+      "mae_hrs": 1.71
+    },
+    "Skin - Sun Exposed (Lower leg)": {
+      "n_samples": 425,
+      "r2": 0.4091,
+      "mae_hrs": 1.69
+    },
+    "Nerve - Tibial": {
+      "n_samples": 389,
+      "r2": 0.4504,
+      "mae_hrs": 1.56
+    }
+  },
+  "donor_r2": 0.47794485425254307,
+  "donor_mae_min": 99.23941739821953,
+  "baseline_mae_min": 156.4348174335469,
+  "improvement_pct": 36.56180955983397,
+  "n_donors": 577
+}
