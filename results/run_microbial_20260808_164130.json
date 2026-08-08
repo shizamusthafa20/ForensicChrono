@@ -1,0 +1,9 @@
+{
+  "timestamp": "20260808_164130",
+  "model_type": "Microbial_RF",
+  "r2": -0.3196404337850789,
+  "mae_days": 1.1795519718448066,
+  "baseline_mae_days": 1.0171669225239548,
+  "improvement_pct": -15.964444549368206,
+  "n_subjects": 12
+}
