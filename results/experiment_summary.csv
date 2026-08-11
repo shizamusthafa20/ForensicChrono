@@ -8,7 +8,7 @@ timestamp,n_donors,donor_r2,donor_mae_hrs,baseline_mae_hrs,improvement_pct,muscl
 20260807_144626,Blend_XGB_RF,836,0.6188,2.44,4.55,46.3,0.5654,2.49,0.6751,2.45,0.5652,2.58,0.576,2.44,1200,stratified_group_kfold,,,
 20260808_120410,Optimized_XGBoost,836,0.6272,2.43,4.55,46.6,0.5497,2.56,0.6662,2.49,0.5618,2.58,0.5622,2.49,2000,standard_5fold_group_kfold,,,
 20260811_230434,836,0.6607,2.26,4.55,50.3,0.614,2.31,0.6865,2.34,0.595,2.49,0.5721,2.37,500,5-fold donor-level,,,,Proper Std 5 Fold (Tissue_Specific_XGBoost)
-,,,,,,,,,,,,,,,,,,,
+20260812_002901,836,0.6873,2.24,4.55,50.8,0.6468,2.27,0.7075,2.35,0.6154,2.48,0.591,2.41,,XGB + RF + ExtraTrees Direct/Log + Ridge,,,,OOF
 ,,,,,,,,,,,,,,,,,,,
 ,,,,,,,,,,,,,,,,,,,
 ,,,,,,,,,,,,,,,,,,,
@@ -17,4 +17,3 @@ timestamp,n_donors,donor_r2,donor_mae_hrs,baseline_mae_hrs,improvement_pct,muscl
 ,,,,,,,,,,,,,,,,,,,
 Microbiome Model,,,,,,,,,,,,,,,,,,,
 20260811_224938,Temp_Aware_Microbial_XGBoost,27,1810,0.9882,10.16,126.6,92,600,donor_5fold_group_kfold_temp_aware,,,,,,,,,,
-20260812_002901,XGB + RF + ExtraTrees Direct/Log + Ridge,836,0.6873,2.24,4.55,50.8,0.6468,2.27,0.7075,2.35,0.6154,2.48,0.591,2.41
