@@ -1,17 +1,36 @@
 """
-rna_model.py  ──  ForensicChrono (Multi-Tissue Model with Per-Tissue Evaluation)
-================================================================================
-Trains a unified multi-tissue model across GTEx tissue samples and reports:
-  1. Per-Tissue R² & MAE (Muscle-only, Lung-only, Skin-only, Nerve-only)
-  2. Overall Sample-Level R² & MAE
-  3. Donor-Averaged Ensemble R² & MAE
+ForensicChrono - RNA Degradation Model
+======================================
 
-Then trains and saves a final deployable model on all data.
+MODEL:
+    Leakage-Controlled Nested OOF Multi-Model Stacking
 
-Methodological Integrity:
-  - Strict 5-Fold Donor GroupKFold Cross-Validation (Zero intra-donor leakage)
-  - In-fold pairwise log-ratio decay kinetics log2(Degrading / Reference)
-  - Zero hardcoded numbers, zero synthetic formulas, zero code cheats
+BASE MODELS:
+    1. XGBoost - direct PMI
+    2. XGBoost - log PMI
+    3. Random Forest - direct PMI
+    4. Random Forest - log PMI
+    5. ExtraTrees - direct PMI
+    6. ExtraTrees - log PMI
+
+META MODEL:
+    Ridge Regression
+
+VALIDATION:
+    Outer 5-fold donor-level CV
+    Inner 4-fold donor-level OOF stacking
+
+OUTPUTS:
+    results/rna_oof_predictions.csv
+    results/rna_donor_predictions.csv
+    results/experiment_summary.csv
+    results/experiment_summary.xlsx
+    results/rna_results.json
+
+    reports/rna_model_predicted_vs_actual.png
+    reports/rna_model_predicted_vs_actual.svg
+
+    models/rna_model.pkl
 """
 
 import os
@@ -19,488 +38,1276 @@ import gzip
 import json
 import pickle
 from datetime import datetime
+
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-try:
-    import xgboost as xgb
-    HAS_XGB = True
-except ImportError:
-    HAS_XGB = False
+from sklearn.ensemble import (
+    RandomForestRegressor,
+    ExtraTreesRegressor
+)
 
-# ── Configuration ──────────────────────────────────────────────────────────────
-SAMPLE_ATTR_PATH   = "data/raw/rna/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
-SUBJECT_PHENO_PATH = "data/raw/rna/GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt"
-GENE_READS_PATH    = "data/raw/rna/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_reads.gct.gz"
+from sklearn.linear_model import Ridge
 
-TARGET_TISSUES = [
+from sklearn.metrics import (
+    r2_score,
+    mean_absolute_error
+)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+SAMPLE_ATTR_PATH = (
+    "data/raw/rna/"
+    "GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
+)
+
+SUBJECT_PHENO_PATH = (
+    "data/raw/rna/"
+    "GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt"
+)
+
+GENE_READS_PATH = (
+    "data/raw/rna/"
+    "GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_reads.gct.gz"
+)
+
+TISSUES = [
     "Muscle - Skeletal",
     "Lung",
     "Skin - Sun Exposed (Lower leg)",
     "Nerve - Tibial",
 ]
 
-MAX_TIME_MIN = 1200   # Drop clear logistical outliers (>20 hrs)
-N_VAR_GENES  = 1200   # Top genes by variance per tissue
-N_DEGRADERS  = 30     # Top negative correlation genes selected IN-FOLD
-N_STABLE     = 10     # Near-zero correlation reference genes selected IN-FOLD
-N_PCA        = 12     # PCA dimensions for ratio features
+MAX_TIME_MIN = 1200
+
+N_GENES = 500
+N_DEGRADERS = 30
+N_STABLE = 10
+
+OUTER_FOLDS = 5
+INNER_FOLDS = 4
+
+SEED = 42
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PURE NUMPY UTILITIES
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# GROUPED CROSS-VALIDATION
+# ============================================================
 
-class NumpyRobustScaler:
-    def fit_transform(self, X):
-        self.center_ = np.median(X, axis=0)
-        q75, q25 = np.percentile(X, [75, 25], axis=0)
-        self.scale_ = q75 - q25
-        self.scale_[self.scale_ == 0.0] = 1.0
-        return (X - self.center_) / self.scale_
+def grouped_folds(groups, n_splits, seed=42):
 
-    def transform(self, X):
-        return (X - self.center_) / self.scale_
+    groups = np.asarray(groups)
 
-
-class NumpyPCA:
-    def __init__(self, n_components=12):
-        self.n_components = n_components
-
-    def fit_transform(self, X):
-        self.mean_ = np.mean(X, axis=0)
-        X_centered = X - self.mean_
-        if X_centered.shape[0] <= 1:
-            return np.zeros((X.shape[0], self.n_components))
-        _, _, Vh = np.linalg.svd(X_centered, full_matrices=False)
-        n_c = min(self.n_components, Vh.shape[0])
-        self.components_ = Vh[:n_c]
-        res = np.dot(X_centered, self.components_.T)
-        if res.shape[1] < self.n_components:
-            res = np.pad(res, ((0, 0), (0, self.n_components - res.shape[1])))
-        return res
-
-    def transform(self, X):
-        X_centered = X - self.mean_
-        res = np.dot(X_centered, self.components_.T)
-        if res.shape[1] < self.n_components:
-            res = np.pad(res, ((0, 0), (0, self.n_components - res.shape[1])))
-        return res
-
-
-def numpy_group_kfold(groups, n_splits=5, seed=42):
     unique_groups = np.unique(groups)
+
+    if len(unique_groups) < n_splits:
+        raise ValueError(
+            f"Only {len(unique_groups)} donors available, "
+            f"but {n_splits} folds requested."
+        )
+
     rng = np.random.RandomState(seed)
+
+    unique_groups = unique_groups.copy()
     rng.shuffle(unique_groups)
-    splits = np.array_split(unique_groups, n_splits)
-    for val_groups in splits:
-        val_mask = np.isin(groups, val_groups)
-        tr_idx = np.where(~val_mask)[0]
-        val_idx = np.where(val_mask)[0]
-        yield tr_idx, val_idx
+
+    folds = np.array_split(
+        unique_groups,
+        n_splits
+    )
+
+    for fold_groups in folds:
+
+        val_mask = np.isin(
+            groups,
+            fold_groups
+        )
+
+        train_idx = np.where(
+            ~val_mask
+        )[0]
+
+        val_idx = np.where(
+            val_mask
+        )[0]
+
+        yield train_idx, val_idx
 
 
-def compute_r2(y_true, y_pred):
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    return 1.0 - (ss_res / (ss_tot + 1e-12))
-
-
-def compute_mae(y_true, y_pred):
-    return np.mean(np.abs(y_true - y_pred))
-
-
-class NumpyRidgeEnsemble:
-    def __init__(self, alpha=4.0):
-        self.alpha = alpha
-
-    def fit(self, X, y):
-        n_samples, n_features = X.shape
-        X_b = np.hstack([np.ones((n_samples, 1)), X])
-        I = np.eye(n_features + 1)
-        I[0, 0] = 0.0
-        self.w = np.linalg.solve(X_b.T @ X_b + self.alpha * I, X_b.T @ y)
-
-    def predict(self, X):
-        X_b = np.hstack([np.ones((X.shape[0], 1)), X])
-        return X_b @ self.w
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# EXPERIMENT LOGGING
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def log_experiment_results(per_tissue_results, donor_r2, donor_mae, baseline_mae,
-                           improvement, n_donors, model_type="Std 5 Fold", out_dir="results"):
-    os.makedirs(out_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    result_record = {
-        "timestamp": timestamp,
-        "model_type": model_type,
-        "config": {
-            "target_tissues": TARGET_TISSUES,
-            "max_time_min": MAX_TIME_MIN,
-            "n_var_genes": N_VAR_GENES,
-            "n_degraders": N_DEGRADERS,
-            "n_stable": N_STABLE,
-            "n_pca": N_PCA,
-            "cv_strategy": "standard_5fold_group_kfold",
-        },
-        "per_tissue_results": per_tissue_results,
-        "donor_r2": float(donor_r2),
-        "donor_mae_min": float(donor_mae),
-        "baseline_mae_min": float(baseline_mae),
-        "improvement_pct": float(improvement),
-        "n_donors": int(n_donors),
-    }
-
-    json_path = os.path.join(out_dir, f"run_{timestamp}.json")
-    with open(json_path, "w") as f:
-        json.dump(result_record, f, indent=2)
-    print(f"\n  Experiment log saved -> {json_path}")
-
-    csv_path = os.path.join(out_dir, "experiment_summary.csv")
-    file_exists = os.path.exists(csv_path)
-
-    summary_dict = {
-        "timestamp": timestamp,
-        "model_type": model_type,
-        "n_donors": n_donors,
-        "donor_r2": round(float(donor_r2), 4),
-        "donor_mae_hrs": round(float(donor_mae) / 60.0, 2),
-        "baseline_mae_hrs": round(float(baseline_mae) / 60.0, 2),
-        "improvement_pct": round(float(improvement), 1),
-    }
-
-    for t in TARGET_TISSUES:
-        t_key = t.split(" - ")[0].lower().replace(" ", "_")
-        if t in per_tissue_results:
-            summary_dict[f"{t_key}_r2"] = per_tissue_results[t]["r2"]
-            summary_dict[f"{t_key}_mae_hrs"] = per_tissue_results[t]["mae_hrs"]
-
-    summary_dict["n_var_genes"] = N_VAR_GENES
-    summary_dict["cv_strategy"] = "standard_5fold_group_kfold"
-
-    summary_row = pd.DataFrame([summary_dict])
-
-    try:
-        summary_row.to_csv(csv_path, mode="a", header=not file_exists, index=False)
-        print(f"  Appended CSV row -> {csv_path}")
-    except PermissionError:
-        print(f"\n  [NOTE] Could not update '{csv_path}' -- close Excel first.")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 1. METADATA LOADING & EXPRESSION ASSEMBLY
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# LOAD DATA
+# ============================================================
 
 def load_data():
+
     print("Loading GTEx metadata...")
-    sa = pd.read_csv(SAMPLE_ATTR_PATH, sep="\t", low_memory=False)
-    sa = sa[["SAMPID", "SMTSISCH", "SMTSD", "SMRIN", "SMATSSCR"]].rename(
-        columns={"SMTSISCH": "time", "SMTSD": "tissue", "SMRIN": "rin", "SMATSSCR": "autolysis"}
+
+    sa = pd.read_csv(
+        SAMPLE_ATTR_PATH,
+        sep="\t",
+        low_memory=False
     )
-    sa = sa.dropna(subset=["time"])
-    sa = sa[(sa["time"] >= 0) & (sa["tissue"].isin(TARGET_TISSUES))]
 
-    sp = pd.read_csv(SUBJECT_PHENO_PATH, sep="\t", low_memory=False)
-    sp["DTHHRDY"] = pd.to_numeric(sp["DTHHRDY"], errors="coerce")
-    sa["SUBJID"] = sa["SAMPID"].str.split("-").str[:2].str.join("-")
-    sa = sa.merge(sp[["SUBJID", "SEX", "AGE", "DTHHRDY"]], on="SUBJID", how="left")
-    sa = sa[sa["time"] <= MAX_TIME_MIN].reset_index(drop=True)
+    sa = sa[
+        [
+            "SAMPID",
+            "SMTSISCH",
+            "SMTSD",
+            "SMRIN",
+            "SMATSSCR"
+        ]
+    ].rename(
+        columns={
+            "SMTSISCH": "time",
+            "SMTSD": "tissue",
+            "SMRIN": "rin",
+            "SMATSSCR": "autolysis"
+        }
+    )
 
-    def _age(b):
+    sa = sa.dropna(
+        subset=["time"]
+    )
+
+    sa = sa[
+        (sa["time"] >= 0) &
+        (sa["time"] <= MAX_TIME_MIN) &
+        (sa["tissue"].isin(TISSUES))
+    ]
+
+    sp = pd.read_csv(
+        SUBJECT_PHENO_PATH,
+        sep="\t",
+        low_memory=False
+    )
+
+    sp["DTHHRDY"] = pd.to_numeric(
+        sp["DTHHRDY"],
+        errors="coerce"
+    )
+
+    sa["SUBJID"] = (
+        sa["SAMPID"]
+        .str.split("-")
+        .str[:2]
+        .str.join("-")
+    )
+
+    sa = sa.merge(
+        sp[
+            [
+                "SUBJID",
+                "SEX",
+                "AGE",
+                "DTHHRDY"
+            ]
+        ],
+        on="SUBJID",
+        how="left"
+    )
+
+    def age_mid(x):
+
         try:
-            lo, hi = str(b).split("-")
-            return (float(lo) + float(hi)) / 2.0
+            lo, hi = str(x).split("-")
+            return (
+                float(lo) +
+                float(hi)
+            ) / 2.0
+
         except Exception:
             return np.nan
 
-    sa["rin"] = pd.to_numeric(sa["rin"], errors="coerce").fillna(sa["rin"].median())
-    sa["autolysis"] = pd.to_numeric(sa["autolysis"], errors="coerce").fillna(0)
-    sa["age"] = sa["AGE"].apply(_age).fillna(sa["AGE"].apply(_age).median())
-    sa["sex"] = pd.to_numeric(sa["SEX"], errors="coerce").fillna(1)
-    sa["hardy"] = pd.to_numeric(sa["DTHHRDY"], errors="coerce").fillna(sa["DTHHRDY"].median())
+    sa["age"] = sa["AGE"].apply(
+        age_mid
+    )
 
-    sid_set = set(sa["SAMPID"])
-    print(f"\nLoading gene expression matrix for target samples...")
+    sa["rin"] = pd.to_numeric(
+        sa["rin"],
+        errors="coerce"
+    )
+
+    sa["autolysis"] = pd.to_numeric(
+        sa["autolysis"],
+        errors="coerce"
+    )
+
+    sa["sex"] = pd.to_numeric(
+        sa["SEX"],
+        errors="coerce"
+    )
+
+    sa["hardy"] = pd.to_numeric(
+        sa["DTHHRDY"],
+        errors="coerce"
+    )
+
+    wanted = set(
+        sa["SAMPID"]
+    )
+
+    print("Loading gene expression...")
+
     rows = {}
-    with gzip.open(GENE_READS_PATH, "rt") as f:
-        f.readline(); f.readline()
-        cols = f.readline().strip().split("\t")[2:]
-        kidx = [i for i, s in enumerate(cols) if s in sid_set]
-        kids = [cols[i] for i in kidx]
+
+    with gzip.open(
+        GENE_READS_PATH,
+        "rt"
+    ) as f:
+
+        f.readline()
+        f.readline()
+
+        columns = (
+            f.readline()
+            .strip()
+            .split("\t")[2:]
+        )
+
+        indices = [
+            i
+            for i, sample in enumerate(columns)
+            if sample in wanted
+        ]
+
+        sample_ids = [
+            columns[i]
+            for i in indices
+        ]
+
         for line in f:
-            p = line.rstrip("\n").split("\t")
-            vals = np.array([float(p[2 + i]) for i in kidx], dtype=np.float32)
-            if vals.var() > 0.5:
-                rows[p[1]] = vals
 
-    genes = list(rows.keys())
-    mat = np.vstack([rows[g] for g in genes]).T
-    expr = pd.DataFrame(mat, index=kids, columns=genes, dtype=np.float32)
+            parts = line.rstrip(
+                "\n"
+            ).split("\t")
 
-    sa = sa[sa["SAMPID"].isin(expr.index)].reset_index(drop=True)
-    print(f"  -> Total valid samples: {len(sa)} across {sa['SUBJID'].nunique()} unique donors.")
+            values = np.array(
+                [
+                    float(
+                        parts[2 + i]
+                    )
+                    for i in indices
+                ],
+                dtype=np.float32
+            )
+
+            if values.var() > 0.1:
+                rows[
+                    parts[1]
+                ] = values
+
+    genes = list(
+        rows.keys()
+    )
+
+    matrix = np.vstack(
+        [
+            rows[g]
+            for g in genes
+        ]
+    ).T
+
+    expr = pd.DataFrame(
+        matrix,
+        index=sample_ids,
+        columns=genes
+    )
+
+    sa = sa[
+        sa["SAMPID"].isin(
+            expr.index
+        )
+    ].reset_index(
+        drop=True
+    )
+
+    expr = expr.loc[
+        sa["SAMPID"]
+    ]
+
+    print(
+        f"Samples : {len(sa)}"
+    )
+
+    print(
+        f"Donors  : "
+        f"{sa['SUBJID'].nunique()}"
+    )
+
+    print(
+        f"Genes   : {expr.shape[1]}"
+    )
 
     return sa, expr
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2. IN-FOLD FEATURE EXTRACTION & CV
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# FEATURE ENGINEERING
+# ============================================================
 
-def build_in_fold_features(G_tr, G_val, y_tr):
-    corrs = np.array([
-        np.corrcoef(G_tr[:, i], y_tr)[0, 1] if G_tr[:, i].std() > 0 else 0.0
-        for i in range(G_tr.shape[1])
-    ])
-    corrs = np.nan_to_num(corrs)
+def make_features(
+    train_df,
+    val_df,
+    train_expr,
+    val_expr
+):
 
-    deg_idx = np.argsort(corrs)[:N_DEGRADERS]
-    sta_idx = np.argsort(np.abs(corrs))[:N_STABLE]
+    train_log = np.log2(
+        train_expr + 1.0
+    )
 
-    def _make_ratios(G):
-        return np.column_stack([G[:, d] - G[:, s] for d in deg_idx for s in sta_idx])
+    val_log = np.log2(
+        val_expr + 1.0
+    )
 
-    R_tr = _make_ratios(G_tr)
-    R_va = _make_ratios(G_val)
+    variance = train_log.var(
+        axis=0
+    )
 
-    scaler = NumpyRobustScaler()
-    R_tr_s = scaler.fit_transform(R_tr)
-    R_va_s = scaler.transform(R_va)
+    selected = (
+        variance
+        .sort_values(
+            ascending=False
+        )
+        .head(N_GENES)
+        .index
+    )
 
-    pca = NumpyPCA(n_components=N_PCA)
-    P_tr = pca.fit_transform(R_tr_s)
-    P_va = pca.transform(R_va_s)
+    train_g = train_log[
+        selected
+    ].values
 
-    S_tr = np.column_stack([R_tr.mean(axis=1), R_tr.std(axis=1), G_tr[:, deg_idx].mean(axis=1)])
-    S_va = np.column_stack([R_va.mean(axis=1), R_va.std(axis=1), G_val[:, deg_idx].mean(axis=1)])
+    val_g = val_log[
+        selected
+    ].values
 
-    return np.hstack([P_tr, S_tr]), np.hstack([P_va, S_va])
+    y = train_df[
+        "time"
+    ].values
 
-
-def train_and_evaluate(sa, expr):
-    n_samples = len(sa)
-    y_all = sa["time"].values
-    groups_all = sa["SUBJID"].values
-
-    tissue_oh = pd.get_dummies(sa["tissue"]).values.astype(np.float64)
-    clin_feats = np.column_stack([
-        sa["rin"].values,
-        sa["rin"].values ** 2,
-        sa["autolysis"].values,
-        sa["age"].values,
-        sa["sex"].values,
-        sa["hardy"].values,
-    ])
-
-    raw_G = expr.loc[sa["SAMPID"]].values.astype(np.float64)
-    top_gene_idx = np.argsort(raw_G.var(axis=0))[-N_VAR_GENES:]
-    G_log = np.log2(raw_G[:, top_gene_idx] + 1.0)
-
-    y_log = np.log2(y_all + 1.0)
-    sample_y_pred = np.zeros(n_samples)
-
-    print("\nRunning 5-Fold Donor GroupKFold CV...")
-
-    for fold, (tr_idx, val_idx) in enumerate(numpy_group_kfold(groups_all, n_splits=5), 1):
-        G_tr, G_val = G_log[tr_idx], G_log[val_idx]
-        y_tr = y_all[tr_idx]
-
-        feat_tr, feat_val = build_in_fold_features(G_tr, G_val, y_tr)
-
-        X_tr = np.hstack([feat_tr, tissue_oh[tr_idx], clin_feats[tr_idx]])
-        X_val = np.hstack([feat_val, tissue_oh[val_idx], clin_feats[val_idx]])
-
-        if HAS_XGB:
-            dtrain = xgb.DMatrix(X_tr, label=y_log[tr_idx])
-            dval = xgb.DMatrix(X_val)
-            params = {
-                "max_depth": 5,
-                "eta": 0.025,
-                "subsample": 0.85,
-                "colsample_bytree": 0.75,
-                "alpha": 0.3,
-                "lambda": 1.0,
-                "objective": "reg:squarederror",
-                "seed": 42,
-                "verbosity": 0,
-            }
-            bst = xgb.train(params, dtrain, num_boost_round=450)
-            pred_log = bst.predict(dval)
-        else:
-            ridge = NumpyRidgeEnsemble(alpha=4.0)
-            ridge.fit(X_tr, y_log[tr_idx])
-            pred_log = ridge.predict(X_val)
-
-        sample_y_pred[val_idx] = np.clip(2.0 ** pred_log - 1.0, 0.0, None)
-        print(f"  Fold {fold}/5 completed.")
-
-    # Build evaluation DataFrame
-    df_eval = pd.DataFrame({
-        "SUBJID": groups_all,
-        "tissue": sa["tissue"],
-        "y_true": y_all,
-        "y_pred": sample_y_pred,
-    })
-
-    # ── 1. PER-TISSUE ACCURACY BREAKDOWN ──
-    print("\n" + "=" * 60)
-    print("  P E R - T I S S U E   A C C U R A C Y   B R E A K D O W N")
-    print("=" * 60)
-    print(f"  {'Tissue Type':<35} | {'Samples':<8} | {'R²':<7} | {'MAE (hrs)':<10}")
-    print("-" * 65)
-
-    per_tissue_results = {}
-    for t in TARGET_TISSUES:
-        t_sub = df_eval[df_eval["tissue"] == t]
-        if len(t_sub) > 5:
-            r2_t = compute_r2(t_sub["y_true"].values, t_sub["y_pred"].values)
-            mae_t = compute_mae(t_sub["y_true"].values, t_sub["y_pred"].values)
-            print(f"  {t:<35} | {len(t_sub):<8} | {r2_t:<7.4f} | {mae_t/60:<10.2f} hrs")
-            per_tissue_results[t] = {
-                "n_samples": len(t_sub),
-                "r2": round(float(r2_t), 4),
-                "mae_hrs": round(float(mae_t) / 60.0, 2),
-            }
-    print("=" * 65)
-
-    # ── 2. DONOR-LEVEL ENSEMBLE ACCURACY ──
-    donor_eval = df_eval.groupby("SUBJID")[["y_true", "y_pred"]].mean()
-    r2_donor = compute_r2(donor_eval["y_true"].values, donor_eval["y_pred"].values)
-    mae_donor = compute_mae(donor_eval["y_true"].values, donor_eval["y_pred"].values)
-    baseline_mae = compute_mae(donor_eval["y_true"].values, np.full_like(donor_eval["y_true"].values, donor_eval["y_true"].mean()))
-    improvement = (1.0 - mae_donor / baseline_mae) * 100.0
-
-    print("\n" + "=" * 60)
-    print("  D O N O R - L E V E L   E N S E M B L E   R E S U L T S")
-    print("=" * 60)
-    print(f"  Total Unique Donors        : {len(donor_eval)}")
-    print(f"  Overall Donor R²           : {r2_donor:.4f}")
-    print(f"  Overall Donor MAE          : {mae_donor:.1f} min ({mae_donor/60:.2f} hrs)")
-    print(f"  Baseline MAE (Mean Guess)  : {baseline_mae:.1f} min")
-    print(f"  Improvement over Baseline  : {improvement:.1f}%")
-    print("=" * 60)
-
-    _save_scatter(donor_eval["y_true"].values, donor_eval["y_pred"].values, r2_donor, mae_donor)
-
-    # Log experiment results to Excel summary CSV
-    log_experiment_results(per_tissue_results, r2_donor, mae_donor, baseline_mae,
-                           improvement, len(donor_eval), model_type="Std 5 Fold")
-
-
-def _save_scatter(y_actual, y_pred, r2, mae, out_dir="reports"):
-    os.makedirs(out_dir, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(7, 6))
-
-    ax.scatter(y_actual, y_pred, alpha=0.45, s=20, color="#1d4ed8", edgecolors="none", label="GTEx Donors", zorder=3)
-    lo = min(y_actual.min(), y_pred.min())
-    hi = max(y_actual.max(), y_pred.max())
-    ax.plot([lo, hi], [lo, hi], "r--", lw=1.5, label="y = x (perfect fit)", zorder=2)
-
-    ax.text(0.05, 0.92, f"Donor R² = {r2:.4f}", transform=ax.transAxes, fontsize=13, fontweight="bold", color="#1e3a8a")
-    ax.text(0.05, 0.85, f"MAE = {mae:.1f} min ({mae/60:.2f} hrs)", transform=ax.transAxes, fontsize=10, color="#475569")
-
-    ax.set_xlabel("Actual Donor Ischemic Time (minutes)", fontsize=12)
-    ax.set_ylabel("Predicted Donor Ischemic Time (minutes)", fontsize=12)
-    ax.set_title("Multi-Tissue PMI Model (Per-Tissue & Donor Evaluation)\n(GTEx v8 Donor-Level Ensemble, 5-Fold Donor GroupKFold)", fontsize=11)
-    ax.legend(fontsize=10, loc="lower right")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-
-    for ext in ("png", "svg"):
-        path = os.path.join(out_dir, f"rna_model_predicted_vs_actual.{ext}")
-        fig.savefig(path, dpi=150)
-        print(f"  Plot saved → {path}")
-    plt.close(fig)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3. FINAL DEPLOYABLE MODEL (trained on ALL data, saved for later reuse)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def train_final_model_and_save(sa, expr, out_path="models/rna_model.pkl"):
-    print("\nTraining final model on all data for deployment...")
-
-    y_all = sa["time"].values
-    tissue_oh = pd.get_dummies(sa["tissue"])
-    tissue_columns = tissue_oh.columns.tolist()
-
-    clin_feats = np.column_stack([
-        sa["rin"].values, sa["rin"].values ** 2, sa["autolysis"].values,
-        sa["age"].values, sa["sex"].values, sa["hardy"].values,
+    correlations = np.array([
+        np.corrcoef(
+            train_g[:, i],
+            y
+        )[0, 1]
+        if train_g[:, i].std() > 0
+        else 0.0
+        for i in range(
+            train_g.shape[1]
+        )
     ])
 
-    raw_G = expr.loc[sa["SAMPID"]].values.astype(np.float64)
-    top_gene_idx = np.argsort(raw_G.var(axis=0))[-N_VAR_GENES:]
-    G_log = np.log2(raw_G[:, top_gene_idx] + 1.0)
+    correlations = np.nan_to_num(
+        correlations
+    )
 
-    corrs = np.array([
-        np.corrcoef(G_log[:, i], y_all)[0, 1] if G_log[:, i].std() > 0 else 0.0
-        for i in range(G_log.shape[1])
-    ])
-    corrs = np.nan_to_num(corrs)
-    deg_idx = np.argsort(corrs)[:N_DEGRADERS]
-    sta_idx = np.argsort(np.abs(corrs))[:N_STABLE]
+    degrader_idx = np.argsort(
+        correlations
+    )[:N_DEGRADERS]
+
+    stable_idx = np.argsort(
+        np.abs(correlations)
+    )[:N_STABLE]
 
     def make_ratios(G):
-        return np.column_stack([G[:, d] - G[:, s] for d in deg_idx for s in sta_idx])
 
-    R = make_ratios(G_log)
-    scaler = NumpyRobustScaler()
-    R_scaled = scaler.fit_transform(R)
-    pca = NumpyPCA(n_components=N_PCA)
-    P = pca.fit_transform(R_scaled)
+        return np.column_stack([
+            G[:, d] - G[:, s]
+            for d in degrader_idx
+            for s in stable_idx
+        ])
 
-    S = np.column_stack([R.mean(axis=1), R.std(axis=1), G_log[:, deg_idx].mean(axis=1)])
+    train_ratio = make_ratios(
+        train_g
+    )
 
-    X_final = np.hstack([P, S, tissue_oh.values.astype(np.float64), clin_feats])
-    y_log = np.log2(y_all + 1.0)
+    val_ratio = make_ratios(
+        val_g
+    )
 
-    if HAS_XGB:
-        final_model = xgb.train(
-            {"max_depth": 5, "eta": 0.025, "subsample": 0.85,
-             "colsample_bytree": 0.75, "alpha": 0.3, "lambda": 1.0,
-             "objective": "reg:squarederror", "seed": 42, "verbosity": 0},
-            xgb.DMatrix(X_final, label=y_log),
-            num_boost_round=450,
+    train_summary = np.column_stack([
+        train_ratio.mean(axis=1),
+        train_ratio.std(axis=1),
+        train_ratio.min(axis=1),
+        train_ratio.max(axis=1),
+        train_g[:, degrader_idx].mean(axis=1),
+        train_g[:, stable_idx].mean(axis=1)
+    ])
+
+    val_summary = np.column_stack([
+        val_ratio.mean(axis=1),
+        val_ratio.std(axis=1),
+        val_ratio.min(axis=1),
+        val_ratio.max(axis=1),
+        val_g[:, degrader_idx].mean(axis=1),
+        val_g[:, stable_idx].mean(axis=1)
+    ])
+
+    numeric_cols = [
+        "rin",
+        "autolysis",
+        "age",
+        "sex",
+        "hardy"
+    ]
+
+    train_clean = train_df.copy()
+    val_clean = val_df.copy()
+
+    for col in numeric_cols:
+
+        median = train_clean[
+            col
+        ].median()
+
+        if pd.isna(median):
+            median = 0.0
+
+        train_clean[col] = (
+            train_clean[col]
+            .fillna(median)
         )
+
+        val_clean[col] = (
+            val_clean[col]
+            .fillna(median)
+        )
+
+    def clinical_features(df):
+
+        rin = df["rin"].values
+        aut = df["autolysis"].values
+        age = df["age"].values
+        sex = df["sex"].values
+        hardy = df["hardy"].values
+
+        return np.column_stack([
+            rin,
+            rin ** 2,
+            aut,
+            aut ** 2,
+            age,
+            sex,
+            hardy,
+            rin * aut,
+            rin / (aut + 1.0)
+        ])
+
+    train_clinical = clinical_features(
+        train_clean
+    )
+
+    val_clinical = clinical_features(
+        val_clean
+    )
+
+    X_train = np.hstack([
+        train_g,
+        train_ratio,
+        train_summary,
+        train_clinical
+    ])
+
+    X_val = np.hstack([
+        val_g,
+        val_ratio,
+        val_summary,
+        val_clinical
+    ])
+
+    return X_train, X_val
+
+
+def build_full_features(df, expr):
+    """
+    Build the final feature matrix using the COMPLETE training
+    dataset for one tissue.
+
+    Returns:
+        X
+        feature_info
+    """
+
+    log_expr = np.log2(
+        expr + 1.0
+    )
+
+    # --------------------------------------------------------
+    # VARIABLE GENES
+    # --------------------------------------------------------
+
+    variance = log_expr.var(
+        axis=0
+    )
+
+    selected = (
+        variance
+        .sort_values(
+            ascending=False
+        )
+        .head(N_GENES)
+        .index
+    )
+
+    G = log_expr[
+        selected
+    ].values
+
+    y = df[
+        "time"
+    ].values
+
+    # --------------------------------------------------------
+    # PMI-CORRELATED GENES
+    # --------------------------------------------------------
+
+    correlations = np.array([
+        np.corrcoef(
+            G[:, i],
+            y
+        )[0, 1]
+        if G[:, i].std() > 0
+        else 0.0
+        for i in range(
+            G.shape[1]
+        )
+    ])
+
+    correlations = np.nan_to_num(
+        correlations
+    )
+
+    degrader_idx = np.argsort(
+        correlations
+    )[:N_DEGRADERS]
+
+    stable_idx = np.argsort(
+        np.abs(correlations)
+    )[:N_STABLE]
+
+    # --------------------------------------------------------
+    # LOG-RATIO FEATURES
+    # --------------------------------------------------------
+
+    ratio_features = np.column_stack([
+        G[:, d] - G[:, s]
+        for d in degrader_idx
+        for s in stable_idx
+    ])
+
+    summary_features = np.column_stack([
+        ratio_features.mean(axis=1),
+        ratio_features.std(axis=1),
+        ratio_features.min(axis=1),
+        ratio_features.max(axis=1),
+        G[:, degrader_idx].mean(axis=1),
+        G[:, stable_idx].mean(axis=1)
+    ])
+
+    # --------------------------------------------------------
+    # CLINICAL / QC FEATURES
+    # --------------------------------------------------------
+
+    numeric_cols = [
+        "rin",
+        "autolysis",
+        "age",
+        "sex",
+        "hardy"
+    ]
+
+    clean = df.copy()
+    medians = {}
+
+    for col in numeric_cols:
+
+        median = clean[
+            col
+        ].median()
+
+        if pd.isna(median):
+            median = 0.0
+
+        medians[col] = float(
+            median
+        )
+
+        clean[col] = (
+            clean[col]
+            .fillna(median)
+        )
+
+    rin = clean["rin"].values
+    aut = clean["autolysis"].values
+    age = clean["age"].values
+    sex = clean["sex"].values
+    hardy = clean["hardy"].values
+
+    clinical = np.column_stack([
+        rin,
+        rin ** 2,
+        aut,
+        aut ** 2,
+        age,
+        sex,
+        hardy,
+        rin * aut,
+        rin / (aut + 1.0)
+    ])
+
+    X = np.hstack([
+        G,
+        ratio_features,
+        summary_features,
+        clinical
+    ])
+
+    feature_info = {
+        "selected_genes":
+            list(selected),
+
+        "degrader_indices":
+            degrader_idx.tolist(),
+
+        "stable_indices":
+            stable_idx.tolist(),
+
+        "clinical_medians":
+            medians,
+
+        "n_genes":
+            N_GENES,
+
+        "n_degraders":
+            N_DEGRADERS,
+
+        "n_stable":
+            N_STABLE
+    }
+
+    return X, feature_info
+
+
+# ============================================================
+# MODEL DEFINITIONS
+# ============================================================
+
+def make_xgb():
+
+    return xgb.XGBRegressor(
+        n_estimators=1000,
+        max_depth=5,
+        learning_rate=0.02,
+        min_child_weight=3,
+        subsample=0.85,
+        colsample_bytree=0.75,
+        gamma=0.05,
+        reg_alpha=0.2,
+        reg_lambda=2.0,
+        objective="reg:squarederror",
+        random_state=SEED,
+        n_jobs=-1
+    )
+
+
+def make_rf():
+
+    return RandomForestRegressor(
+        n_estimators=600,
+        max_depth=16,
+        min_samples_leaf=2,
+        max_features="sqrt",
+        n_jobs=-1,
+        random_state=SEED
+    )
+
+
+def make_extra():
+
+    return ExtraTreesRegressor(
+        n_estimators=600,
+        max_depth=None,
+        min_samples_leaf=2,
+        max_features="sqrt",
+        n_jobs=-1,
+        random_state=SEED
+    )
+
+
+# ============================================================
+# BASE MODEL TRAIN + PREDICT
+# ============================================================
+
+def train_predict(
+    model_type,
+    target_mode,
+    X_train,
+    y_train,
+    X_val
+):
+
+    if model_type == "xgb":
+        model = make_xgb()
+    elif model_type == "rf":
+        model = make_rf()
+    elif model_type == "extra":
+        model = make_extra()
     else:
-        final_model = NumpyRidgeEnsemble(alpha=4.0)
-        final_model.fit(X_final, y_log)
+        raise ValueError("Unknown model type.")
 
-    os.makedirs("models", exist_ok=True)
-    with open(out_path, "wb") as f:
-        pickle.dump({
-            "model": final_model,
-            "top_gene_idx": top_gene_idx,
-            "deg_idx": deg_idx,
-            "sta_idx": sta_idx,
-            "scaler_center": scaler.center_,
-            "scaler_scale": scaler.scale_,
-            "pca_mean": pca.mean_,
-            "pca_components": pca.components_,
-            "tissue_columns": tissue_columns,
-            "gene_names": expr.columns[top_gene_idx].tolist(),
-        }, f)
+    if target_mode == "direct":
+        model.fit(X_train, y_train)
+        prediction = model.predict(X_val)
+    else:
+        model.fit(X_train, np.log1p(y_train))
+        prediction = np.expm1(model.predict(X_val))
 
-    print(f"  -> Final deployment model saved to {out_path}")
+    return np.clip(prediction, 0, MAX_TIME_MIN)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4. MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+MODEL_CONFIGS = [
+    ("xgb_direct", "xgb", "direct"),
+    ("xgb_log", "xgb", "log"),
+    ("rf_direct", "rf", "direct"),
+    ("rf_log", "rf", "log"),
+    ("extra_direct", "extra", "direct"),
+    ("extra_log", "extra", "log")
+]
+
+
+# ============================================================
+# NESTED OOF EVALUATION
+# ============================================================
+
+def evaluate_nested_oof(sa, expr):
+
+    final_predictions = np.zeros(len(sa))
+    all_oof_base_predictions = np.zeros((len(sa), len(MODEL_CONFIGS)))
+    tissue_results = {}
+
+    for tissue in TISSUES:
+
+        print("\n")
+        print("=" * 70)
+        print(f"TISSUE: {tissue}")
+        print("=" * 70)
+
+        tissue_indices = np.where(sa["tissue"].values == tissue)[0]
+        tissue_sa = sa.iloc[tissue_indices].reset_index(drop=True)
+        tissue_expr = expr.loc[tissue_sa["SAMPID"]]
+        groups = tissue_sa["SUBJID"].values
+
+        tissue_predictions = np.zeros(len(tissue_sa))
+
+        for outer_fold, (outer_train_idx, outer_val_idx) in enumerate(
+            grouped_folds(groups, OUTER_FOLDS, SEED), 1
+        ):
+
+            print(f"\nOuter fold {outer_fold}/{OUTER_FOLDS}")
+
+            outer_train_df = tissue_sa.iloc[outer_train_idx]
+            outer_val_df = tissue_sa.iloc[outer_val_idx]
+            outer_train_expr = tissue_expr.iloc[outer_train_idx]
+            outer_val_expr = tissue_expr.iloc[outer_val_idx]
+
+            inner_groups = outer_train_df["SUBJID"].values
+            inner_oof = np.zeros((len(outer_train_df), len(MODEL_CONFIGS)))
+
+            print("  Creating inner OOF predictions...")
+
+            for inner_fold, (inner_train_idx, inner_val_idx) in enumerate(
+                grouped_folds(inner_groups, INNER_FOLDS, SEED + outer_fold), 1
+            ):
+
+                inner_train_df = outer_train_df.iloc[inner_train_idx]
+                inner_val_df = outer_train_df.iloc[inner_val_idx]
+                inner_train_expr = outer_train_expr.iloc[inner_train_idx]
+                inner_val_expr = outer_train_expr.iloc[inner_val_idx]
+
+                X_train, X_val = make_features(
+                    inner_train_df, inner_val_df,
+                    inner_train_expr, inner_val_expr
+                )
+                y_train = inner_train_df["time"].values
+
+                for col, (name, model_type, target_mode) in enumerate(MODEL_CONFIGS):
+                    inner_oof[inner_val_idx, col] = train_predict(
+                        model_type, target_mode, X_train, y_train, X_val
+                    )
+
+                print(f"    Inner fold {inner_fold}/{INNER_FOLDS}")
+
+            meta_model = Ridge(alpha=10.0)
+            meta_model.fit(inner_oof, outer_train_df["time"].values)
+
+            X_train, X_val = make_features(
+                outer_train_df, outer_val_df,
+                outer_train_expr, outer_val_expr
+            )
+            y_train = outer_train_df["time"].values
+
+            outer_predictions = np.zeros((len(outer_val_df), len(MODEL_CONFIGS)))
+
+            for col, (name, model_type, target_mode) in enumerate(MODEL_CONFIGS):
+                outer_predictions[:, col] = train_predict(
+                    model_type, target_mode, X_train, y_train, X_val
+                )
+
+            stacked_prediction = meta_model.predict(outer_predictions)
+            stacked_prediction = np.clip(stacked_prediction, 0, MAX_TIME_MIN)
+
+            tissue_predictions[outer_val_idx] = stacked_prediction
+
+            all_oof_base_predictions[tissue_indices[outer_val_idx], :] = outer_predictions
+            print("  Outer fold completed.")
+
+        actual = tissue_sa["time"].values
+        r2 = r2_score(actual, tissue_predictions)
+        mae = mean_absolute_error(actual, tissue_predictions)
+
+        tissue_results[tissue] = {
+            "r2": float(r2),
+            "mae_minutes": float(mae)
+        }
+
+        final_predictions[tissue_indices] = tissue_predictions
+
+        print(f"\n{tissue}")
+        print(f"R²  : {r2:.4f}")
+        print(f"MAE : {mae:.1f} min ({mae / 60:.2f} hrs)")
+
+    return final_predictions, all_oof_base_predictions, tissue_results
+
+
+# ============================================================
+# FINAL DEPLOYABLE MODEL
+# ============================================================
+
+def train_final_deployable_model(
+    sa,
+    expr,
+    all_oof_base_predictions
+):
+    """
+    Train the final deployable model after OOF evaluation.
+
+    The six base models are trained on ALL available samples
+    within each tissue.
+
+    The Ridge meta-model is trained on the already-generated
+    OUT-OF-FOLD predictions from the evaluation stage. This
+    avoids using in-sample base-model predictions to train the
+    meta-model.
+
+    A separate Ridge meta-model is stored for each tissue,
+    matching the tissue-specific validation architecture.
+    """
+
+    print("\n" + "=" * 70)
+    print("TRAINING FINAL DEPLOYABLE MODEL")
+    print("=" * 70)
+
+    deployable_models = {}
+
+    for tissue in TISSUES:
+
+        print(f"\nFinal training: {tissue}")
+
+        tissue_indices = np.where(
+            sa["tissue"].values == tissue
+        )[0]
+
+        tissue_sa = sa.iloc[
+            tissue_indices
+        ].reset_index(
+            drop=True
+        )
+
+        tissue_expr = expr.loc[
+            tissue_sa["SAMPID"]
+        ]
+
+        # ----------------------------------------------------
+        # Build final features on ALL data for this tissue
+        # ----------------------------------------------------
+
+        X, feature_info = build_full_features(
+            tissue_sa,
+            tissue_expr
+        )
+
+        y = tissue_sa[
+            "time"
+        ].values
+
+        # ----------------------------------------------------
+        # Six final base models
+        # ----------------------------------------------------
+
+        models = {}
+
+        for name, model_type, target_mode in MODEL_CONFIGS:
+
+            print(
+                f"  Training {name}..."
+            )
+
+            if model_type == "xgb":
+                model = make_xgb()
+
+            elif model_type == "rf":
+                model = make_rf()
+
+            else:
+                model = make_extra()
+
+            if target_mode == "direct":
+                model.fit(
+                    X,
+                    y
+                )
+            else:
+                model.fit(
+                    X,
+                    np.log1p(y)
+                )
+
+            models[name] = model
+
+        # ----------------------------------------------------
+        # Final Ridge
+        #
+        # Use ONLY OOF predictions generated during the
+        # evaluation stage. These predictions are already
+        # out-of-fold for every sample.
+        # ----------------------------------------------------
+
+        tissue_oof = all_oof_base_predictions[
+            tissue_indices,
+            :
+        ]
+
+        ridge = Ridge(
+            alpha=10.0
+        )
+
+        ridge.fit(
+            tissue_oof,
+            y
+        )
+
+        print(
+            "  Ridge meta-model trained on "
+            "out-of-fold predictions."
+        )
+
+        deployable_models[
+            tissue
+        ] = {
+            "base_models": models,
+            "meta_model": ridge,
+            "feature_info": feature_info
+        }
+
+    # --------------------------------------------------------
+    # Complete package
+    # --------------------------------------------------------
+
+    package = {
+
+        "model_type":
+            "Nested OOF "
+            "XGB_RF_ExtraTrees_Ridge",
+
+        "base_models":
+            deployable_models,
+
+        "tissues":
+            TISSUES,
+
+        "max_time_min":
+            MAX_TIME_MIN,
+
+        "n_genes":
+            N_GENES,
+
+        "n_degraders":
+            N_DEGRADERS,
+
+        "n_stable":
+            N_STABLE,
+
+        "seed":
+            SEED,
+
+        "base_model_configs":
+            MODEL_CONFIGS,
+
+        "description":
+            "Final deployable tissue-specific "
+            "RNA PMI stacking model. Base models "
+            "are trained on all available data; "
+            "Ridge meta-models are trained only "
+            "on out-of-fold predictions."
+    }
+
+    os.makedirs(
+        "models",
+        exist_ok=True
+    )
+
+    model_path = (
+        "models/"
+        "rna_model.pkl"
+    )
+
+    with open(
+        model_path,
+        "wb"
+    ) as f:
+
+        pickle.dump(
+            package,
+            f
+        )
+
+    print(
+        f"\nDeployable model saved -> "
+        f"{model_path}"
+    )
+
+
+# ============================================================
+# REGRESSION GRAPH
+# ============================================================
+
+def save_regression_graph(donor, r2, mae, out_dir="reports"):
+    os.makedirs(out_dir, exist_ok=True)
+
+    actual = donor["actual"].values
+    predicted = donor["predicted"].values
+
+    slope, intercept = np.polyfit(actual, predicted, 1)
+    x = np.linspace(actual.min(), actual.max(), 100)
+    regression_line = slope * x + intercept
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    ax.scatter(
+        actual, predicted, alpha=0.45, s=24,
+        color="#2563eb", edgecolors="none", label="Held-out donors"
+    )
+
+    lo = min(actual.min(), predicted.min())
+    hi = max(actual.max(), predicted.max())
+
+    ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.5, label="Perfect prediction")
+    ax.plot(x, regression_line, color="#059669", linewidth=2, label="Regression line")
+
+    ax.text(0.05, 0.93, f"R² = {r2:.4f}", transform=ax.transAxes, fontsize=13, fontweight="bold")
+    ax.text(0.05, 0.87, f"MAE = {mae:.1f} min ({mae / 60:.2f} hrs)", transform=ax.transAxes, fontsize=11)
+
+    ax.set_xlabel("Actual Donor Ischemic Time (minutes)")
+    ax.set_ylabel("Predicted Donor Ischemic Time (minutes)")
+    ax.set_title("ForensicChrono RNA Model\nNested OOF Multi-Model Stacking")
+
+    ax.legend(loc="lower right")
+    ax.grid(True, linestyle="--", alpha=0.35)
+    plt.tight_layout()
+
+    png_path = os.path.join(out_dir, "rna_model_predicted_vs_actual.png")
+    svg_path = os.path.join(out_dir, "rna_model_predicted_vs_actual.svg")
+
+    fig.savefig(png_path, dpi=300)
+    fig.savefig(svg_path)
+    plt.close(fig)
+
+    print(f"Regression graph saved -> {png_path}")
+
+
+# ============================================================
+# EXCEL + CSV LOGGING
+# ============================================================
+
+def save_results(summary, sample_predictions, donor_predictions):
+    os.makedirs("results", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    sample_predictions.to_csv("results/rna_oof_predictions.csv", index=False)
+    donor_predictions.to_csv("results/rna_donor_predictions.csv")
+
+    summary_row = {
+        "Timestamp": timestamp,
+        "Model": "XGB + RF + ExtraTrees Direct/Log + Ridge",
+        "Donors": summary["n_donors"],
+        "R2": round(summary["donor_r2"], 4),
+        "MAE (hours)": round(summary["donor_mae_hours"], 2),
+        "Baseline MAE (hours)": round(summary["baseline_mae_minutes"] / 60, 2),
+        "Improvement (%)": round(summary["improvement_percent"], 1),
+        "Outer CV": "5-fold donor-level",
+        "Inner CV": "4-fold donor-level",
+        "Leakage": "None"
+    }
+
+    summary_df = pd.DataFrame([summary_row])
+
+    csv_path = "results/experiment_summary.csv"
+    file_exists = os.path.exists(csv_path)
+
+    csv_dict = {
+        "timestamp": timestamp,
+        "model_type": summary_row["Model"],
+        "n_donors": summary["n_donors"],
+        "donor_r2": round(summary["donor_r2"], 4),
+        "donor_mae_hrs": round(summary["donor_mae_hours"], 2),
+        "baseline_mae_hrs": round(summary["baseline_mae_minutes"] / 60.0, 2),
+        "improvement_pct": round(summary["improvement_percent"], 1),
+    }
+
+    tissue_res = summary["tissue_results"]
+    for t in TISSUES:
+        t_key = t.split(" - ")[0].lower().replace(" ", "_")
+        if t in tissue_res:
+            csv_dict[f"{t_key}_r2"] = round(tissue_res[t]["r2"], 4)
+            csv_dict[f"{t_key}_mae_hrs"] = round(tissue_res[t]["mae_minutes"] / 60.0, 2)
+
+    csv_df = pd.DataFrame([csv_dict])
+    try:
+        csv_df.to_csv(csv_path, mode="a", header=not file_exists, index=False)
+        print(f"Summary appended -> {csv_path}")
+    except Exception as e:
+        print(f"Could not write CSV: {e}")
+
+    try:
+        excel_path = "results/experiment_summary.xlsx"
+        tissue_rows = []
+        for tissue, values in summary["tissue_results"].items():
+            tissue_rows.append({
+                "Tissue": tissue,
+                "R2": round(values["r2"], 4),
+                "MAE (hours)": round(values["mae_minutes"] / 60, 2)
+            })
+        tissue_df = pd.DataFrame(tissue_rows)
+
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            summary_df.to_excel(writer, sheet_name="Summary", index=False)
+            tissue_df.to_excel(writer, sheet_name="Tissue Results", index=False)
+            sample_predictions.to_excel(writer, sheet_name="OOF Predictions", index=False)
+            donor_predictions.reset_index().to_excel(writer, sheet_name="Donor Predictions", index=False)
+        print(f"Excel saved -> {excel_path}")
+    except Exception as e:
+        print(f"[NOTE] Excel export skipped ({e}). CSV logged cleanly.")
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
+
     sa, expr = load_data()
-    train_and_evaluate(sa, expr)           # Phase 1: Honest CV evaluation
-    train_final_model_and_save(sa, expr)   # Phase 2: Save deployment model
+
+    (
+        final_predictions,
+        all_oof_base_predictions,
+        tissue_results
+    ) = evaluate_nested_oof(sa, expr)
+
+    sample_results = pd.DataFrame({
+        "SUBJID": sa["SUBJID"].values,
+        "tissue": sa["tissue"].values,
+        "actual": sa["time"].values,
+        "predicted": final_predictions
+    })
+
+    sample_results["absolute_error"] = np.abs(
+        sample_results["actual"] - sample_results["predicted"]
+    )
+
+    donor_results = (
+        sample_results
+        .groupby("SUBJID")
+        .agg(
+            actual=("actual", "mean"),
+            predicted=("predicted", "mean")
+        )
+    )
+
+    donor_results["absolute_error"] = np.abs(
+        donor_results["actual"] - donor_results["predicted"]
+    )
+
+    donor_r2 = r2_score(donor_results["actual"], donor_results["predicted"])
+    donor_mae = mean_absolute_error(donor_results["actual"], donor_results["predicted"])
+
+    baseline_prediction = np.full(
+        len(donor_results), donor_results["actual"].mean()
+    )
+
+    baseline_mae = mean_absolute_error(
+        donor_results["actual"], baseline_prediction
+    )
+
+    improvement = (1.0 - donor_mae / baseline_mae) * 100.0
+
+    summary = {
+        "model_type": "Nested OOF XGB_RF_ExtraTrees_Ridge",
+        "donor_r2": float(donor_r2),
+        "donor_mae_minutes": float(donor_mae),
+        "donor_mae_hours": float(donor_mae / 60),
+        "baseline_mae_minutes": float(baseline_mae),
+        "improvement_percent": float(improvement),
+        "n_donors": int(len(donor_results)),
+        "n_samples": int(len(sample_results)),
+        "tissue_results": tissue_results,
+        "outer_cv": "5-fold donor-level",
+        "inner_cv": "4-fold donor-level",
+        "base_models": [
+            "XGBoost direct", "XGBoost log",
+            "Random Forest direct", "Random Forest log",
+            "ExtraTrees direct", "ExtraTrees log"
+        ],
+        "meta_model": "Ridge",
+        "target_leakage": False
+    }
+
+    print("\n" + "=" * 70)
+    print("FINAL NESTED OOF RNA RESULTS")
+    print("=" * 70)
+    print(f"Samples : {len(sample_results)}")
+    print(f"Donors  : {len(donor_results)}")
+    print(f"R²      : {donor_r2:.4f}")
+    print(f"MAE     : {donor_mae:.1f} min ({donor_mae / 60:.2f} hrs)")
+    print(f"Baseline improvement : {improvement:.1f}%")
+
+    print("\nPer-tissue results:")
+    for tissue, values in tissue_results.items():
+        print(f"{tissue}: R²={values['r2']:.4f}, MAE={values['mae_minutes']/60:.2f} hrs")
+
+    os.makedirs("results", exist_ok=True)
+
+    with open("results/rna_results.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+    save_regression_graph(donor_results, donor_r2, donor_mae)
+    save_results(summary, sample_results, donor_results)
+    train_final_deployable_model(
+        sa,
+        expr,
+        all_oof_base_predictions
+    )
+
+    print("\n" + "=" * 70)
+    print("COMPLETE")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

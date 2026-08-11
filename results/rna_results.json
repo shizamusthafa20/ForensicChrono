@@ -1,0 +1,40 @@
+{
+  "model_type": "Nested OOF XGB_RF_ExtraTrees_Ridge",
+  "donor_r2": 0.6873369284107016,
+  "donor_mae_minutes": 134.13611872326894,
+  "donor_mae_hours": 2.235601978721149,
+  "baseline_mae_minutes": 272.84251257220916,
+  "improvement_percent": 50.83752987805772,
+  "n_donors": 836,
+  "n_samples": 2470,
+  "tissue_results": {
+    "Muscle - Skeletal": {
+      "r2": 0.6468192471851368,
+      "mae_minutes": 136.4327072417974
+    },
+    "Lung": {
+      "r2": 0.7075026611193769,
+      "mae_minutes": 141.07319673245894
+    },
+    "Skin - Sun Exposed (Lower leg)": {
+      "r2": 0.6153754635952879,
+      "mae_minutes": 148.9053692985939
+    },
+    "Nerve - Tibial": {
+      "r2": 0.5909724031561165,
+      "mae_minutes": 144.54888190774798
+    }
+  },
+  "outer_cv": "5-fold donor-level",
+  "inner_cv": "4-fold donor-level",
+  "base_models": [
+    "XGBoost direct",
+    "XGBoost log",
+    "Random Forest direct",
+    "Random Forest log",
+    "ExtraTrees direct",
+    "ExtraTrees log"
+  ],
+  "meta_model": "Ridge",
+  "target_leakage": false
+}

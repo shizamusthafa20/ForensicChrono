@@ -1,0 +1,10 @@
+{
+  "timestamp": "20260811_221454",
+  "model_type": "Microbial_XGBoost",
+  "r2": 0.3583403086740474,
+  "mae_days": 3.745084279993786,
+  "baseline_mae_days": 5.274851195018467,
+  "improvement_pct": 29.00113877087912,
+  "n_donors": 27,
+  "n_samples": 1810
+}

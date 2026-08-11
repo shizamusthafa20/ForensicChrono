@@ -1,0 +1,10 @@
+{
+  "timestamp": "20260811_220922",
+  "model_type": "Microbial_RF",
+  "r2": 0.45089424957507396,
+  "mae_days": 3.617700971007827,
+  "baseline_mae_days": 5.274851195018467,
+  "improvement_pct": 31.41605635388618,
+  "n_donors": 27,
+  "n_samples": 1810
+}
