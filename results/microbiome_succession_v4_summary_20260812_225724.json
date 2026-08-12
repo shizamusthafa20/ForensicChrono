@@ -1,0 +1,25 @@
+{
+    "model": "Microbiome Succession V4",
+    "samples": 1810,
+    "donors": 27,
+    "r2": 0.4757798900386553,
+    "mae_days": 3.493526855454058,
+    "mae_hours": 83.8446445308974,
+    "baseline_mae_days": 5.274851195018467,
+    "improvement_percent": 33.770134430458995,
+    "cv": "5-fold donor-grouped",
+    "environment_used": false,
+    "pmi_as_input": false,
+    "trajectory_method": "training-only unsupervised PCA",
+    "features": [
+        "CLR",
+        "log_relative_abundance",
+        "Shannon",
+        "Simpson",
+        "richness",
+        "evenness",
+        "dominance",
+        "top_abundance",
+        "unsupervised_PCA_trajectory"
+    ]
+}
