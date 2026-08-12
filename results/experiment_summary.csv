@@ -21,3 +21,4 @@ Microbiome Model,,,,,,,,,,,,,,,,,,,
 20260812_105548,24-Prediction Multi-Tissue XGB + RF + ExtraTrees + RidgeCV,2470,836,0.6868,133.99,2.23,4.55,50.9,6,4,24,5-fold donor-level,4-fold donor-level,None
 20260812_110807,Temp_Aware_Microbial_XGBoost,27,1810,0.3654,89.66,-29.7856,47.44,7.8,-507.9,600,donor_5fold_group_kfold_temp_aware,None (pmi*temp_c interaction removed; temp median imputed in-fold)
 20260812_115028,Multi-Tissue Donor-Level XGB + RF + ExtraTrees + Ridge,836,0.6674,2.3,4.55,49.5,5-fold donor-level,4-fold donor-level,None
+20260812_122426,XGB + RF + ExtraTrees Direct/Log + Ridge,836,0.6873,2.24,4.55,50.8,0.6468,2.27,0.7075,2.35,0.6154,2.48,0.591,2.41
