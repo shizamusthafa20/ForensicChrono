@@ -1,0 +1,55 @@
+{
+    "project": "ForensicChrono",
+    "module": "Microbial Succession PMI Model",
+    "dataset": "Qiita 13810",
+    "timestamp": "20260812_221421",
+    "samples": 1810,
+    "donors": 27,
+    "sample_r2": 0.947837521468235,
+    "sample_mae_days": 0.9871462583593448,
+    "sample_mae_hours": 23.691510200624275,
+    "baseline_mae_days": 5.274851195018467,
+    "improvement_percent": 81.2857989379568,
+    "donor_level_r2": -3.854808639103455,
+    "donor_level_mae_days": 0.7202049143158457,
+    "cv": "5-fold donor-grouped",
+    "microbiome_features": [
+        "relative_abundance",
+        "CLR",
+        "log_relative_abundance",
+        "prevalence_filtering",
+        "variance_taxa_selection",
+        "PMI_associated_taxa_selection_in_training_fold",
+        "Shannon",
+        "Simpson",
+        "richness",
+        "evenness",
+        "dominance",
+        "top_abundance_features"
+    ],
+    "environmental_features": [
+        "indoor_add",
+        "outdoor_add",
+        "indoor_ADD_squared",
+        "ADD_indoor_minus_outdoor",
+        "ADD_indoor_outdoor_ratio",
+        "indoor_ADD_log",
+        "outdoor_ADD_log",
+        "indoor_outdoor"
+    ],
+    "anatomical_features": [
+        "body_site"
+    ],
+    "models": [
+        "XGBoost_direct",
+        "XGBoost_log",
+        "ExtraTrees",
+        "RandomForest",
+        "PLS",
+        "weighted_ensemble"
+    ],
+    "target_leakage": false,
+    "pmi_as_input_feature": false,
+    "pmi_times_temperature": false,
+    "pmi_times_add": false
+}

@@ -1,0 +1,22 @@
+FORENSICCHRONO
+MICROBIAL SUCCESSION PMI MODEL
+=================================================================
+
+Samples: 1810
+Donors: 27
+Sample R2: 0.9478
+Sample MAE: 0.9871 days
+Sample MAE hours: 23.69
+Baseline MAE: 5.2749 days
+Improvement: 81.29%
+Donor R2: -3.8548
+Donor MAE: 0.7202 days
+
+Environmental variables used:
+  indoor_add
+  outdoor_add
+  indoor_outdoor
+  body_site
+
+No PMI-derived input features were used.
+Evaluation uses donor-grouped CV.
