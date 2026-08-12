@@ -1,0 +1,12 @@
+{
+  "timestamp": "20260812_110807",
+  "model_type": "Temp_Aware_Microbial_XGBoost",
+  "sample_r2": 0.36538336436914187,
+  "sample_mae_days": 3.7358413037077334,
+  "donor_r2": -29.785649273725774,
+  "donor_mae_days": 1.976789383728587,
+  "baseline_mae_days": 0.32519379359504724,
+  "improvement_pct": -507.88041551316184,
+  "n_donors": 27,
+  "n_samples": 1810
+}

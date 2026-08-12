@@ -1,0 +1,22 @@
+{
+  "timestamp": "20260812_105548",
+  "model": "24-Prediction Multi-Tissue Donor Stacking",
+  "samples": 2470,
+  "donors": 836,
+  "r2": 0.6867528962264626,
+  "mae_minutes": 133.98560911540454,
+  "mae_hours": 2.2330934852567426,
+  "baseline_mae_minutes": 272.84251257220916,
+  "improvement_percent": 50.892693425133096,
+  "base_models": 6,
+  "tissues": [
+    "Muscle - Skeletal",
+    "Lung",
+    "Skin - Sun Exposed (Lower leg)",
+    "Nerve - Tibial"
+  ],
+  "stacking_features": 24,
+  "outer_folds": 5,
+  "inner_folds": 4,
+  "leakage": "None"
+}
