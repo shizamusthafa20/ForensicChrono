@@ -4,3 +4,4 @@ __pycache__/
 .ipynb_checkpoints/
 .env
 data/raw/
+models/rna_model.pkl
