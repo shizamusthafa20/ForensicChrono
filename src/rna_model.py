@@ -92,6 +92,11 @@ N_GENES = 500
 N_DEGRADERS = 30
 N_STABLE = 10
 
+# Compact tree ensemble used consistently for BOTH validation and deployment.
+XGB_TREES = 500
+RF_TREES = 300
+EXTRA_TREES = 300
+
 OUTER_FOLDS = 5
 INNER_FOLDS = 4
 
@@ -703,7 +708,7 @@ def build_full_features(df, expr):
 def make_xgb():
 
     return xgb.XGBRegressor(
-        n_estimators=1000,
+        n_estimators=XGB_TREES,
         max_depth=5,
         learning_rate=0.02,
         min_child_weight=3,
@@ -721,7 +726,7 @@ def make_xgb():
 def make_rf():
 
     return RandomForestRegressor(
-        n_estimators=600,
+        n_estimators=RF_TREES,
         max_depth=16,
         min_samples_leaf=2,
         max_features="sqrt",
@@ -733,7 +738,7 @@ def make_rf():
 def make_extra():
 
     return ExtraTreesRegressor(
-        n_estimators=600,
+        n_estimators=EXTRA_TREES,
         max_depth=None,
         min_samples_leaf=2,
         max_features="sqrt",
@@ -1048,8 +1053,13 @@ def train_final_deployable_model(
         "seed":
             SEED,
 
-        "base_model_configs":
-            MODEL_CONFIGS,
+        "base_model_configs": MODEL_CONFIGS,
+
+        "tree_counts": {
+            "xgb": XGB_TREES,
+            "random_forest": RF_TREES,
+            "extra_trees": EXTRA_TREES
+        },
 
         "description":
             "Final deployable tissue-specific "
@@ -1092,33 +1102,32 @@ def train_final_deployable_model(
 def save_regression_graph(donor, r2, mae, out_dir="reports"):
     os.makedirs(out_dir, exist_ok=True)
 
-    actual = donor["actual"].values
+    actual    = donor["actual"].values
     predicted = donor["predicted"].values
-
-    slope, intercept = np.polyfit(actual, predicted, 1)
-    x = np.linspace(actual.min(), actual.max(), 100)
-    regression_line = slope * x + intercept
 
     fig, ax = plt.subplots(figsize=(8, 7))
 
     ax.scatter(
-        actual, predicted, alpha=0.45, s=24,
-        color="#2563eb", edgecolors="none", label="Held-out donors"
+        actual, predicted,
+        alpha=0.45, s=24,
+        color="#2563eb", edgecolors="none",
+        label="Held-out donors"
     )
 
-    lo = min(actual.min(), predicted.min())
-    hi = max(actual.max(), predicted.max())
+    # ONE line only — fitted predicted-vs-actual regression line
+    slope, intercept = np.polyfit(actual, predicted, 1)
+    x = np.linspace(actual.min(), actual.max(), 100)
+    regression_line = slope * x + intercept
+    ax.plot(x, regression_line, linewidth=2.0, label="Fitted regression line")
 
-    ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.5, label="Perfect prediction")
-    ax.plot(x, regression_line, color="#059669", linewidth=2, label="Regression line")
-
-    ax.text(0.05, 0.93, f"R² = {r2:.4f}", transform=ax.transAxes, fontsize=13, fontweight="bold")
-    ax.text(0.05, 0.87, f"MAE = {mae:.1f} min ({mae / 60:.2f} hrs)", transform=ax.transAxes, fontsize=11)
+    ax.text(0.05, 0.93, f"R² = {r2:.4f}",
+            transform=ax.transAxes, fontsize=13, fontweight="bold")
+    ax.text(0.05, 0.87, f"MAE = {mae:.1f} min ({mae / 60:.2f} hrs)",
+            transform=ax.transAxes, fontsize=11)
 
     ax.set_xlabel("Actual Donor Ischemic Time (minutes)")
     ax.set_ylabel("Predicted Donor Ischemic Time (minutes)")
     ax.set_title("ForensicChrono RNA Model\nNested OOF Multi-Model Stacking")
-
     ax.legend(loc="lower right")
     ax.grid(True, linestyle="--", alpha=0.35)
     plt.tight_layout()
@@ -1146,7 +1155,7 @@ def save_results(summary, sample_predictions, donor_predictions):
 
     summary_row = {
         "Timestamp": timestamp,
-        "Model": "XGB + RF + ExtraTrees Direct/Log + Ridge",
+        "Model": "Compact XGB + RF + ExtraTrees Direct/Log + Ridge",
         "Donors": summary["n_donors"],
         "R2": round(summary["donor_r2"], 4),
         "MAE (hours)": round(summary["donor_mae_hours"], 2),

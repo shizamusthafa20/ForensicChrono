@@ -1,28 +1,28 @@
 {
   "model_type": "Nested OOF XGB_RF_ExtraTrees_Ridge",
-  "donor_r2": 0.6873369284107017,
-  "donor_mae_minutes": 134.13611872326888,
-  "donor_mae_hours": 2.235601978721148,
+  "donor_r2": 0.689013898540912,
+  "donor_mae_minutes": 133.92070972672468,
+  "donor_mae_hours": 2.2320118287787447,
   "baseline_mae_minutes": 272.84251257220916,
-  "improvement_percent": 50.837529878057744,
+  "improvement_percent": 50.91647981680205,
   "n_donors": 836,
   "n_samples": 2470,
   "tissue_results": {
     "Muscle - Skeletal": {
-      "r2": 0.6468192471851366,
-      "mae_minutes": 136.43270724179737
+      "r2": 0.6468482071315296,
+      "mae_minutes": 136.28306648340987
     },
     "Lung": {
-      "r2": 0.7075026611193771,
-      "mae_minutes": 141.0731967324588
+      "r2": 0.7084741000465336,
+      "mae_minutes": 141.0449423693898
     },
     "Skin - Sun Exposed (Lower leg)": {
-      "r2": 0.6153754635952884,
-      "mae_minutes": 148.90536929859377
+      "r2": 0.6199136515624684,
+      "mae_minutes": 147.4581869397007
     },
     "Nerve - Tibial": {
-      "r2": 0.5909724031561163,
-      "mae_minutes": 144.54888190774804
+      "r2": 0.5935084091936595,
+      "mae_minutes": 143.7348460667426
     }
   },
   "outer_cv": "5-fold donor-level",
