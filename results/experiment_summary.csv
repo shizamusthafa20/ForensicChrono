@@ -25,3 +25,5 @@ Microbiome Model,,,,,,,,,,,,,,,,,,,
 20260812_122938,Microbial_Succession_XGBoost,27,1810,0.3758,3.7,88.86,126.6,29.8,600,donor_5fold_group_kfold_sample_level_eval
 20260813_110627,Microbial_XGB_ET_RF_PLS_Ensemble,27,0.9478,23.69,-3.8548,17.28,81.3
 20260813_164044,Compact XGB + RF + ExtraTrees Direct/Log + Ridge,836,0.689,2.23,4.55,50.9,0.6468,2.27,0.7085,2.35,0.6199,2.46,0.5935,2.4
+20260815_185520,Compact XGB + RF + ExtraTrees Direct/Log + Ridge,836,0.7278,2.07,4.55,54.4,0.6581,2.24,0.751,2.12,0.6656,2.28,0.6538,2.19
+20260815_235125,Compact XGB + RF + ExtraTrees Direct/Log + Ridge,836,0.7267,2.08,4.55,54.3,0.6621,2.25,0.7477,2.15,0.6658,2.28,0.6533,2.22

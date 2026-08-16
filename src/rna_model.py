@@ -88,9 +88,9 @@ TISSUES = [
 
 MAX_TIME_MIN = 1200
 
-N_GENES = 500
-N_DEGRADERS = 30
-N_STABLE = 10
+N_GENES = 1500
+N_DEGRADERS = 75
+N_STABLE = 30
 
 # Compact tree ensemble used consistently for BOTH validation and deployment.
 XGB_TREES = 500
@@ -1222,14 +1222,32 @@ def save_results(summary, sample_predictions, donor_predictions):
 
 def main():
 
+    print("\n" + "=" * 70)
+    print("FORENSICCHRONO RNA MODEL — FINAL EVALUATION + DEPLOYMENT")
+    print("=" * 70)
+    print(f"N_GENES     : {N_GENES}")
+    print(f"N_DEGRADERS : {N_DEGRADERS}")
+    print(f"N_STABLE    : {N_STABLE}")
+    print("Nested donor-level OOF evaluation + final deployable model")
+    print("=" * 70)
+
+    # ------------------------------------------------------------
+    # LOAD DATA
+    # ------------------------------------------------------------
     sa, expr = load_data()
 
+    # ------------------------------------------------------------
+    # 1. LEAKAGE-CONTROLLED NESTED OOF EVALUATION
+    # ------------------------------------------------------------
     (
         final_predictions,
         all_oof_base_predictions,
         tissue_results
     ) = evaluate_nested_oof(sa, expr)
 
+    # ------------------------------------------------------------
+    # SAMPLE-LEVEL OOF RESULTS
+    # ------------------------------------------------------------
     sample_results = pd.DataFrame({
         "SUBJID": sa["SUBJID"].values,
         "tissue": sa["tissue"].values,
@@ -1237,10 +1255,9 @@ def main():
         "predicted": final_predictions
     })
 
-    sample_results["absolute_error"] = np.abs(
-        sample_results["actual"] - sample_results["predicted"]
-    )
-
+    # ------------------------------------------------------------
+    # DONOR-LEVEL RESULTS
+    # ------------------------------------------------------------
     donor_results = (
         sample_results
         .groupby("SUBJID")
@@ -1250,72 +1267,142 @@ def main():
         )
     )
 
-    donor_results["absolute_error"] = np.abs(
-        donor_results["actual"] - donor_results["predicted"]
+    donor_r2 = r2_score(
+        donor_results["actual"],
+        donor_results["predicted"]
     )
 
-    donor_r2 = r2_score(donor_results["actual"], donor_results["predicted"])
-    donor_mae = mean_absolute_error(donor_results["actual"], donor_results["predicted"])
-
-    baseline_prediction = np.full(
-        len(donor_results), donor_results["actual"].mean()
+    donor_mae = mean_absolute_error(
+        donor_results["actual"],
+        donor_results["predicted"]
     )
 
     baseline_mae = mean_absolute_error(
-        donor_results["actual"], baseline_prediction
+        donor_results["actual"],
+        np.full(
+            len(donor_results),
+            donor_results["actual"].mean()
+        )
     )
 
-    improvement = (1.0 - donor_mae / baseline_mae) * 100.0
+    improvement_percent = (
+        100.0 * (baseline_mae - donor_mae) / baseline_mae
+        if baseline_mae > 0 else 0.0
+    )
 
     summary = {
-        "model_type": "Nested OOF XGB_RF_ExtraTrees_Ridge",
-        "donor_r2": float(donor_r2),
-        "donor_mae_minutes": float(donor_mae),
-        "donor_mae_hours": float(donor_mae / 60),
-        "baseline_mae_minutes": float(baseline_mae),
-        "improvement_percent": float(improvement),
         "n_donors": int(len(donor_results)),
-        "n_samples": int(len(sample_results)),
-        "tissue_results": tissue_results,
-        "outer_cv": "5-fold donor-level",
-        "inner_cv": "4-fold donor-level",
-        "base_models": [
-            "XGBoost direct", "XGBoost log",
-            "Random Forest direct", "Random Forest log",
-            "ExtraTrees direct", "ExtraTrees log"
-        ],
-        "meta_model": "Ridge",
-        "target_leakage": False
+        "donor_r2": float(donor_r2),
+        "donor_mae_hours": float(donor_mae / 60.0),
+        "baseline_mae_minutes": float(baseline_mae),
+        "improvement_percent": float(improvement_percent),
+        "tissue_results": tissue_results
     }
 
+    # ------------------------------------------------------------
+    # PRINT FINAL EVALUATION RESULTS
+    # ------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("FINAL NESTED OOF RNA RESULTS")
+    print("FINAL NESTED OOF RNA RESULT")
     print("=" * 70)
     print(f"Samples : {len(sample_results)}")
     print(f"Donors  : {len(donor_results)}")
     print(f"R²      : {donor_r2:.4f}")
     print(f"MAE     : {donor_mae:.1f} min ({donor_mae / 60:.2f} hrs)")
-    print(f"Baseline improvement : {improvement:.1f}%")
 
     print("\nPer-tissue results:")
     for tissue, values in tissue_results.items():
-        print(f"{tissue}: R²={values['r2']:.4f}, MAE={values['mae_minutes']/60:.2f} hrs")
+        print(
+            f"{tissue}: "
+            f"R²={values['r2']:.4f}, "
+            f"MAE={values['mae_minutes']/60:.2f} hrs"
+        )
 
+    # ------------------------------------------------------------
+    # 2. SAVE OOF RESULTS + EXCEL/CSV
+    # ------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("SAVING EVALUATION RESULTS")
+    print("=" * 70)
+
+    save_results(
+        summary,
+        sample_results,
+        donor_results
+    )
+
+    # ------------------------------------------------------------
+    # 3. SAVE REGRESSION GRAPH
+    # ------------------------------------------------------------
+    save_regression_graph(
+        donor_results,
+        donor_r2,
+        donor_mae
+    )
+
+    # ------------------------------------------------------------
+    # 4. SAVE JSON SUMMARY
+    # ------------------------------------------------------------
     os.makedirs("results", exist_ok=True)
 
-    with open("results/rna_results.json", "w") as f:
-        json.dump(summary, f, indent=2)
+    json_summary = {
+        "model": "Compact XGB + RF + ExtraTrees Direct/Log + Ridge",
+        "validation": {
+            "outer_folds": OUTER_FOLDS,
+            "inner_folds": INNER_FOLDS,
+            "grouping": "donor-level",
+            "leakage_controlled": True
+        },
+        "samples": int(len(sample_results)),
+        "donors": int(len(donor_results)),
+        "r2": float(donor_r2),
+        "mae_minutes": float(donor_mae),
+        "mae_hours": float(donor_mae / 60.0),
+        "baseline_mae_minutes": float(baseline_mae),
+        "improvement_percent": float(improvement_percent),
+        "tissue_results": tissue_results,
+        "configuration": {
+            "n_genes": N_GENES,
+            "n_degraders": N_DEGRADERS,
+            "n_stable": N_STABLE,
+            "xgb_trees": XGB_TREES,
+            "rf_trees": RF_TREES,
+            "extra_trees": EXTRA_TREES,
+            "seed": SEED
+        }
+    }
 
-    save_regression_graph(donor_results, donor_r2, donor_mae)
-    save_results(summary, sample_results, donor_results)
+    with open("results/rna_results.json", "w", encoding="utf-8") as f:
+        json.dump(json_summary, f, indent=2)
+
+    print("JSON saved -> results/rna_results.json")
+
+    # ------------------------------------------------------------
+    # 5. TRAIN + SAVE FINAL DEPLOYABLE MODEL
+    # ------------------------------------------------------------
     train_final_deployable_model(
         sa,
         expr,
         all_oof_base_predictions
     )
 
+    # ------------------------------------------------------------
+    # FINAL STATUS
+    # ------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("COMPLETE")
+    print("FINAL RNA PIPELINE COMPLETE")
+    print("=" * 70)
+    print(f"Validated donor-level R² : {donor_r2:.4f}")
+    print(f"Validated donor-level MAE: {donor_mae:.1f} min ({donor_mae / 60:.2f} hrs)")
+    print("\nCreated files:")
+    print("  results/rna_oof_predictions.csv")
+    print("  results/rna_donor_predictions.csv")
+    print("  results/experiment_summary.csv")
+    print("  results/experiment_summary.xlsx")
+    print("  results/rna_results.json")
+    print("  reports/rna_model_predicted_vs_actual.png")
+    print("  reports/rna_model_predicted_vs_actual.svg")
+    print("  models/rna_model.pkl")
     print("=" * 70)
 
 

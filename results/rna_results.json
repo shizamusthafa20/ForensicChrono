@@ -1,40 +1,43 @@
 {
-  "model_type": "Nested OOF XGB_RF_ExtraTrees_Ridge",
-  "donor_r2": 0.689013898540912,
-  "donor_mae_minutes": 133.92070972672468,
-  "donor_mae_hours": 2.2320118287787447,
+  "model": "Compact XGB + RF + ExtraTrees Direct/Log + Ridge",
+  "validation": {
+    "outer_folds": 5,
+    "inner_folds": 4,
+    "grouping": "donor-level",
+    "leakage_controlled": true
+  },
+  "samples": 2470,
+  "donors": 836,
+  "r2": 0.7267249391209278,
+  "mae_minutes": 124.69074807127882,
+  "mae_hours": 2.0781791345213136,
   "baseline_mae_minutes": 272.84251257220916,
-  "improvement_percent": 50.91647981680205,
-  "n_donors": 836,
-  "n_samples": 2470,
+  "improvement_percent": 54.29936966356049,
   "tissue_results": {
     "Muscle - Skeletal": {
-      "r2": 0.6468482071315296,
-      "mae_minutes": 136.28306648340987
+      "r2": 0.6620922273082872,
+      "mae_minutes": 134.91184713414097
     },
     "Lung": {
-      "r2": 0.7084741000465336,
-      "mae_minutes": 141.0449423693898
+      "r2": 0.7477390820408572,
+      "mae_minutes": 128.8261006607941
     },
     "Skin - Sun Exposed (Lower leg)": {
-      "r2": 0.6199136515624684,
-      "mae_minutes": 147.4581869397007
+      "r2": 0.6658430427101085,
+      "mae_minutes": 136.6999817749662
     },
     "Nerve - Tibial": {
-      "r2": 0.5935084091936595,
-      "mae_minutes": 143.7348460667426
+      "r2": 0.6532620274043692,
+      "mae_minutes": 132.99859540086288
     }
   },
-  "outer_cv": "5-fold donor-level",
-  "inner_cv": "4-fold donor-level",
-  "base_models": [
-    "XGBoost direct",
-    "XGBoost log",
-    "Random Forest direct",
-    "Random Forest log",
-    "ExtraTrees direct",
-    "ExtraTrees log"
-  ],
-  "meta_model": "Ridge",
-  "target_leakage": false
+  "configuration": {
+    "n_genes": 1500,
+    "n_degraders": 75,
+    "n_stable": 30,
+    "xgb_trees": 500,
+    "rf_trees": 300,
+    "extra_trees": 300,
+    "seed": 42
+  }
 }
