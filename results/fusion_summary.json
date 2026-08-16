@@ -1,0 +1,16 @@
+{
+    "project": "ForensicChrono",
+    "fusion_type": "Reliability-weighted late fusion",
+    "rna_raw_r2": 0.6842615684602851,
+    "rna_raw_mae_hours": 2.227154352914302,
+    "rna_calibrated_r2": 0.6834778530477856,
+    "rna_calibrated_mae_hours": 2.2270060450448272,
+    "microbiome_raw_r2": 0.9478375214682349,
+    "microbiome_raw_mae_hours": 23.691510200624275,
+    "microbiome_calibrated_r2": 0.947432628492912,
+    "microbiome_calibrated_mae_hours": 23.949369160723496,
+    "fusion_r2": null,
+    "fusion_mae_hours": null,
+    "fusion_validation": "Not directly estimable because RNA and microbiome cohorts are unpaired.",
+    "important_microbiome_note": "Microbiome main performance is sample/longitudinal OOF performance. The donor-level R2 diagnostic is not used as the component performance."
+}

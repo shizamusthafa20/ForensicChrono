@@ -1,58 +1,63 @@
 """
 ======================================================================
 FORENSICCHRONO
-RELIABILITY-WEIGHTED LATE FUSION
+RELIABILITY-WEIGHTED LATE FUSION - CORRECTED VERSION
 ======================================================================
 
-PURPOSE
--------
-Combine the independently validated RNA and microbiome PMI models.
-
 RNA:
-    OOF prediction -> minutes -> hours
-    Nested donor-level OOF validation
+    OOF predictions:
+        results/rna_oof_predictions.csv
 
-Microbiome:
-    OOF prediction -> days -> hours
-    Donor-grouped OOF validation
+    Columns:
+        SUBJID
+        tissue
+        actual
+        predicted
 
-FUSION
-------
-    RNA prediction
-          |
-      Calibration
-          |
-      Uncertainty
-          |
-          |\
-          | \
-          |  \
-          |   > Reliability-weighted late fusion
-          |  /
-          | /
-    Uncertainty
-          |
-    Calibration
-          |
-    Microbiome prediction
+    Unit:
+        minutes
 
-OUTPUT
-------
-    ONE PMI estimate in hours
-    95% confidence interval
-    RNA reliability
-    Microbiome reliability
-    Primary evidence source
+MICROBIOME:
+    OOF predictions:
+        results/microbial_oof_predictions.csv
+
+    Columns:
+        sample_id
+        subject_id
+        actual_pmi
+        ensemble_prediction
+
+    Unit:
+        days
 
 IMPORTANT
 ---------
-Because RNA and microbiome datasets are UNPAIRED, this script does
-NOT report a fusion R² or fusion MAE.
+DO NOT aggregate the microbiome samples to 27 donors.
 
-The individual model OOF metrics are real and are reported separately.
+The original microbiome model reports its main OOF performance at
+sample/longitudinal level:
 
-This is NOT a conventional supervised cross-modal meta-model.
-It is a reliability-weighted late-fusion engine.
+    R²  ≈ 0.9478
+    MAE ≈ 0.987 days = 23.7 hours
+
+The donor-level R² of -3.8548 is a separate diagnostic and must NOT
+be used as the main microbiome model performance in fusion.
+
+Calibration DOES use GroupKFold by donor to prevent donor leakage.
+
+FUSION:
+    1. Load OOF predictions
+    2. Convert both modalities to hours
+    3. Evaluate original OOF performance
+    4. Cross-fitted Ridge calibration using GroupKFold
+    5. Estimate uncertainty from held-out calibration residuals
+    6. Compute reliability using inverse variance
+    7. Perform reliability-weighted late fusion
+    8. Save deployable fusion model
+
+There is intentionally NO fusion R² because RNA and microbiome
+datasets contain different/unpaired donors.
+
 ======================================================================
 """
 
@@ -64,7 +69,7 @@ import numpy as np
 import pandas as pd
 
 from sklearn.linear_model import Ridge
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold
 from sklearn.metrics import r2_score, mean_absolute_error
 from sklearn.neighbors import KNeighborsRegressor
 
@@ -75,19 +80,15 @@ from sklearn.neighbors import KNeighborsRegressor
 
 SEED = 42
 
-# Calibration
 CALIBRATION_FOLDS = 5
 RIDGE_ALPHA = 10.0
 
-# Uncertainty
 MIN_SIGMA_HOURS = 1.0
 CI_Z = 1.96
 
-# Existing OOF files
 RNA_OOF_PATH = "results/rna_oof_predictions.csv"
 MICROBIAL_OOF_PATH = "results/microbial_oof_predictions.csv"
 
-# Output files
 MODEL_DIR = "models"
 RESULTS_DIR = "results"
 
@@ -157,6 +158,7 @@ def load_rna_oof():
 
     required = [
         "SUBJID",
+        "tissue",
         "actual",
         "predicted"
     ]
@@ -169,14 +171,14 @@ def load_rna_oof():
     if missing:
 
         raise ValueError(
-            "RNA OOF file is missing columns: "
-            f"{missing}\n"
+            f"RNA OOF file is missing: {missing}\n"
             f"Available columns: {list(df.columns)}"
         )
 
     df = df[
         [
             "SUBJID",
+            "tissue",
             "actual",
             "predicted"
         ]
@@ -194,14 +196,14 @@ def load_rna_oof():
 
     df = df.dropna(
         subset=[
+            "SUBJID",
             "actual",
             "predicted"
         ]
     )
 
     # --------------------------------------------------------------
-    # RNA is predicted in MINUTES.
-    # Convert to HOURS.
+    # RNA: minutes -> hours
     # --------------------------------------------------------------
 
     df["actual_hours"] = (
@@ -212,29 +214,9 @@ def load_rna_oof():
         df["predicted"] / 60.0
     )
 
-    # --------------------------------------------------------------
-    # Donor-level aggregation
-    #
-    # The RNA model has multiple samples per donor.
-    # Aggregate before calibration so donors contribute equally.
-    # --------------------------------------------------------------
-
-    donor_df = (
-        df
-        .groupby(
-            "SUBJID",
-            as_index=False
-        )
-        .agg(
-            actual_hours=(
-                "actual_hours",
-                "mean"
-            ),
-            prediction_hours=(
-                "prediction_hours",
-                "mean"
-            )
-        )
+    df["donor_id"] = (
+        df["SUBJID"]
+        .astype(str)
     )
 
     print(
@@ -242,10 +224,13 @@ def load_rna_oof():
     )
 
     print(
-        f"RNA donors  : {len(donor_df)}"
+        f"RNA donors  : "
+        f"{df['donor_id'].nunique()}"
     )
 
-    return donor_df
+    return df.reset_index(
+        drop=True
+    )
 
 
 # ======================================================================
@@ -286,8 +271,7 @@ def load_microbiome_oof():
     if missing:
 
         raise ValueError(
-            "Microbiome OOF file is missing columns: "
-            f"{missing}\n"
+            f"Microbiome OOF file is missing: {missing}\n"
             f"Available columns: {list(df.columns)}"
         )
 
@@ -312,14 +296,14 @@ def load_microbiome_oof():
 
     df = df.dropna(
         subset=[
+            "subject_id",
             "actual_pmi",
             "ensemble_prediction"
         ]
     )
 
     # --------------------------------------------------------------
-    # Microbiome is predicted in DAYS.
-    # Convert to HOURS.
+    # Microbiome: days -> hours
     # --------------------------------------------------------------
 
     df["actual_hours"] = (
@@ -330,26 +314,9 @@ def load_microbiome_oof():
         df["ensemble_prediction"] * 24.0
     )
 
-    # --------------------------------------------------------------
-    # Donor-level aggregation
-    # --------------------------------------------------------------
-
-    donor_df = (
-        df
-        .groupby(
-            "subject_id",
-            as_index=False
-        )
-        .agg(
-            actual_hours=(
-                "actual_hours",
-                "mean"
-            ),
-            prediction_hours=(
-                "prediction_hours",
-                "mean"
-            )
-        )
+    df["donor_id"] = (
+        df["subject_id"]
+        .astype(str)
     )
 
     print(
@@ -357,19 +324,23 @@ def load_microbiome_oof():
     )
 
     print(
-        f"Microbiome donors  : {len(donor_df)}"
+        f"Microbiome donors  : "
+        f"{df['donor_id'].nunique()}"
     )
 
-    return donor_df
+    return df.reset_index(
+        drop=True
+    )
 
 
 # ======================================================================
-# CROSS-FITTED RIDGE CALIBRATION
+# CROSS-FITTED GROUPED CALIBRATION
 # ======================================================================
 
-def cross_fitted_calibration(
+def cross_fitted_group_calibration(
     predictions,
-    actual
+    actual,
+    groups
 ):
 
     predictions = np.asarray(
@@ -382,36 +353,50 @@ def cross_fitted_calibration(
         dtype=float
     )
 
-    n = len(predictions)
+    groups = np.asarray(
+        groups
+    )
 
-    if n < CALIBRATION_FOLDS:
+    unique_groups = np.unique(
+        groups
+    )
+
+    n_groups = len(
+        unique_groups
+    )
+
+    if n_groups < CALIBRATION_FOLDS:
 
         raise ValueError(
-            f"Only {n} donors available. "
-            f"Need at least {CALIBRATION_FOLDS} "
-            f"for calibration."
+            f"Only {n_groups} donors available. "
+            f"Need at least {CALIBRATION_FOLDS}."
         )
 
-    kfold = KFold(
-        n_splits=CALIBRATION_FOLDS,
-        shuffle=True,
-        random_state=SEED
+    gkf = GroupKFold(
+        n_splits=CALIBRATION_FOLDS
     )
 
     calibrated_oof = np.zeros(
-        n,
+        len(predictions),
         dtype=float
     )
 
     # --------------------------------------------------------------
-    # Generate honest calibration OOF predictions
+    # Cross-fitted calibration
+    #
+    # Every validation fold contains donors that were not used
+    # to train that fold's calibration model.
     # --------------------------------------------------------------
 
     for fold, (
         train_idx,
         val_idx
     ) in enumerate(
-        kfold.split(predictions),
+        gkf.split(
+            predictions,
+            actual,
+            groups
+        ),
         start=1
     ):
 
@@ -445,7 +430,7 @@ def cross_fitted_calibration(
     # --------------------------------------------------------------
     # Final calibration model
     #
-    # This is the model used during deployment.
+    # Used for future deployment.
     # --------------------------------------------------------------
 
     final_calibrator = Ridge(
@@ -482,7 +467,9 @@ def fit_uncertainty_model(
         dtype=float
     )
 
-    # Prevent KNN from failing on very small datasets.
+    # KNN estimates typical error magnitude
+    # around a particular predicted PMI.
+
     n_neighbors = min(
         15,
         len(x)
@@ -507,7 +494,7 @@ def fit_uncertainty_model(
 
 
 # ======================================================================
-# CALIBRATE ONE MODEL
+# PREPARE ONE COMPONENT
 # ======================================================================
 
 def prepare_component(
@@ -527,8 +514,16 @@ def prepare_component(
         "prediction_hours"
     ].values
 
+    groups = df[
+        "donor_id"
+    ].values
+
     # --------------------------------------------------------------
-    # Original OOF performance
+    # ORIGINAL MODEL OOF PERFORMANCE
+    #
+    # IMPORTANT:
+    # This is calculated at the same sample/longitudinal level
+    # as the original model's main reported result.
     # --------------------------------------------------------------
 
     raw_metrics = calculate_metrics(
@@ -537,15 +532,16 @@ def prepare_component(
     )
 
     # --------------------------------------------------------------
-    # Cross-fitted calibration
+    # GROUPED CROSS-FITTED CALIBRATION
     # --------------------------------------------------------------
 
     (
         calibrated_oof,
         calibrator
-    ) = cross_fitted_calibration(
+    ) = cross_fitted_group_calibration(
         raw_prediction,
-        y
+        y,
+        groups
     )
 
     calibrated_metrics = (
@@ -556,7 +552,7 @@ def prepare_component(
     )
 
     # --------------------------------------------------------------
-    # OOF residuals
+    # HELD-OUT CALIBRATION RESIDUALS
     # --------------------------------------------------------------
 
     residuals = (
@@ -587,10 +583,7 @@ def prepare_component(
     )
 
     # --------------------------------------------------------------
-    # Local uncertainty model
-    #
-    # This allows reliability to change depending on
-    # where the prediction lies in the PMI range.
+    # LOCAL UNCERTAINTY MODEL
     # --------------------------------------------------------------
 
     uncertainty_model = (
@@ -666,12 +659,15 @@ def prepare_component(
             calibrated_oof,
 
         "residuals":
-            residuals
+            residuals,
+
+        "groups":
+            groups
     }
 
 
 # ======================================================================
-# GET UNCERTAINTY FOR A NEW PREDICTION
+# ESTIMATE UNCERTAINTY FOR NEW PREDICTION
 # ======================================================================
 
 def estimate_uncertainty(
@@ -698,8 +694,6 @@ def estimate_uncertainty(
     #
     # MAE ≈ sigma * sqrt(2/pi)
     #
-    # therefore:
-    #
     # sigma ≈ MAE / sqrt(2/pi)
 
     local_sigma = (
@@ -709,19 +703,14 @@ def estimate_uncertainty(
         )
     )
 
-    # Don't allow local estimate to become
-    # unrealistically smaller than the global
-    # residual uncertainty.
-
-    minimum_allowed = (
-        component[
-            "global_sigma_hours"
-        ] * 0.50
-    )
+    # Prevent uncertainty from becoming
+    # unrealistically tiny.
 
     local_sigma = max(
         local_sigma,
-        minimum_allowed,
+        component[
+            "global_sigma_hours"
+        ] * 0.50,
         MIN_SIGMA_HOURS
     )
 
@@ -775,7 +764,7 @@ def fuse_predictions(
         )
     )
 
-    micro_calibrated = (
+    microbiome_calibrated = (
         calibrate_new_prediction(
             microbiome_component,
             microbiome_raw_hours
@@ -791,35 +780,30 @@ def fuse_predictions(
         rna_calibrated
     )
 
-    micro_sigma = estimate_uncertainty(
+    microbiome_sigma = estimate_uncertainty(
         microbiome_component,
-        micro_calibrated
+        microbiome_calibrated
     )
 
     # --------------------------------------------------------------
     # PRECISION
     #
-    # Higher precision = lower uncertainty
-    # Higher precision = greater reliability
+    # precision = 1 / variance
     # --------------------------------------------------------------
 
     rna_precision = (
         1.0 /
-        (
-            rna_sigma ** 2
-        )
+        (rna_sigma ** 2)
     )
 
-    micro_precision = (
+    microbiome_precision = (
         1.0 /
-        (
-            micro_sigma ** 2
-        )
+        (microbiome_sigma ** 2)
     )
 
     total_precision = (
         rna_precision +
-        micro_precision
+        microbiome_precision
     )
 
     # --------------------------------------------------------------
@@ -831,8 +815,8 @@ def fuse_predictions(
         total_precision
     )
 
-    micro_weight = (
-        micro_precision /
+    microbiome_weight = (
+        microbiome_precision /
         total_precision
     )
 
@@ -840,37 +824,37 @@ def fuse_predictions(
     # FINAL PMI
     # --------------------------------------------------------------
 
-    fused_pmi = (
+    final_pmi = (
         rna_weight *
         rna_calibrated
         +
-        micro_weight *
-        micro_calibrated
+        microbiome_weight *
+        microbiome_calibrated
     )
 
     # --------------------------------------------------------------
     # COMBINED UNCERTAINTY
     # --------------------------------------------------------------
 
-    fused_sigma = np.sqrt(
+    final_sigma = np.sqrt(
         1.0 /
         total_precision
     )
 
     # --------------------------------------------------------------
-    # 95% CONFIDENCE INTERVAL
+    # APPROXIMATE 95% INTERVAL
     # --------------------------------------------------------------
 
     lower = (
-        fused_pmi -
+        final_pmi -
         CI_Z *
-        fused_sigma
+        final_sigma
     )
 
     upper = (
-        fused_pmi +
+        final_pmi +
         CI_Z *
-        fused_sigma
+        final_sigma
     )
 
     lower = max(
@@ -887,11 +871,11 @@ def fuse_predictions(
     # PRIMARY EVIDENCE
     # --------------------------------------------------------------
 
-    if rna_weight > micro_weight:
+    if rna_weight > microbiome_weight:
 
         primary_evidence = "RNA"
 
-    elif micro_weight > rna_weight:
+    elif microbiome_weight > rna_weight:
 
         primary_evidence = "Microbiome"
 
@@ -902,40 +886,40 @@ def fuse_predictions(
     return {
 
         "rna_raw_hours":
-            rna_raw_hours,
+            float(rna_raw_hours),
 
         "microbiome_raw_hours":
-            microbiome_raw_hours,
+            float(microbiome_raw_hours),
 
         "rna_calibrated_hours":
-            rna_calibrated,
+            float(rna_calibrated),
 
         "microbiome_calibrated_hours":
-            micro_calibrated,
+            float(microbiome_calibrated),
 
         "rna_uncertainty_hours":
-            rna_sigma,
+            float(rna_sigma),
 
         "microbiome_uncertainty_hours":
-            micro_sigma,
+            float(microbiome_sigma),
 
         "rna_weight":
-            rna_weight,
+            float(rna_weight),
 
         "microbiome_weight":
-            micro_weight,
+            float(microbiome_weight),
 
         "final_pmi_hours":
-            fused_pmi,
+            float(final_pmi),
 
         "final_uncertainty_hours":
-            fused_sigma,
+            float(final_sigma),
 
         "ci95_lower_hours":
-            lower,
+            float(lower),
 
         "ci95_upper_hours":
-            upper,
+            float(upper),
 
         "primary_evidence":
             primary_evidence
@@ -943,7 +927,7 @@ def fuse_predictions(
 
 
 # ======================================================================
-# SAVE MODEL
+# SAVE DEPLOYABLE FUSION MODEL
 # ======================================================================
 
 def save_fusion_model(
@@ -1006,14 +990,9 @@ def save_fusion_model(
         },
 
         "method":
-            "Precision-weighted "
+            "GroupKFold calibration + "
             "uncertainty-aware "
-            "late fusion",
-
-        "validation":
-            "RNA and microbiome were "
-            "independently evaluated using "
-            "donor-level OOF predictions.",
+            "precision-weighted late fusion",
 
         "fusion_r2":
             None,
@@ -1022,9 +1001,9 @@ def save_fusion_model(
             None,
 
         "fusion_metric_note":
-            "Direct fusion R²/MAE cannot be "
-            "estimated because the source "
-            "datasets are unpaired."
+            "Direct fusion R2/MAE cannot be "
+            "estimated because RNA and "
+            "microbiome cohorts are unpaired."
     }
 
     with open(
@@ -1045,10 +1024,10 @@ def save_fusion_model(
 
 
 # ======================================================================
-# SAVE COMPONENT RESULTS
+# SAVE RESULTS
 # ======================================================================
 
-def save_component_results(
+def save_results(
     rna_component,
     microbiome_component
 ):
@@ -1100,103 +1079,13 @@ def save_component_results(
         index=False
     )
 
-    print(
-        f"Component results saved -> "
-        f"{FUSION_COMPONENT_PATH}"
-    )
-
-    return result_df
-
-
-# ======================================================================
-# MAIN TRAINING
-# ======================================================================
-
-def main():
-
-    print_header(
-        "FORENSICCHRONO"
-    )
-
-    print(
-        "RELIABILITY-WEIGHTED "
-        "LATE FUSION"
-    )
-
-    print()
-    print(
-        "RNA + MICROBIOME"
-    )
-
-    print(
-        "No simulation."
-    )
-
-    print(
-        "No supervised cross-modal "
-        "meta-model."
-    )
-
-    print(
-        "No artificial fusion R²."
-    )
-
-    # --------------------------------------------------------------
-    # LOAD
-    # --------------------------------------------------------------
-
-    rna_df = load_rna_oof()
-
-    microbiome_df = (
-        load_microbiome_oof()
-    )
-
-    # --------------------------------------------------------------
-    # CALIBRATION
-    # --------------------------------------------------------------
-
-    rna_component = (
-        prepare_component(
-            "RNA",
-            rna_df
-        )
-    )
-
-    microbiome_component = (
-        prepare_component(
-            "Microbiome",
-            microbiome_df
-        )
-    )
-
-    # --------------------------------------------------------------
-    # SAVE
-    # --------------------------------------------------------------
-
-    save_fusion_model(
-        rna_component,
-        microbiome_component
-    )
-
-    component_df = (
-        save_component_results(
-            rna_component,
-            microbiome_component
-        )
-    )
-
-    # --------------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------------
-
     summary = {
 
         "project":
             "ForensicChrono",
 
         "fusion_type":
-            "Reliability-weighted "
-            "late fusion",
+            "Reliability-weighted late fusion",
 
         "rna_raw_r2":
             rna_component[
@@ -1249,16 +1138,11 @@ def main():
             "RNA and microbiome cohorts are "
             "unpaired.",
 
-        "deployment_output":
-            [
-                "RNA PMI",
-                "Microbiome PMI",
-                "RNA reliability",
-                "Microbiome reliability",
-                "Final PMI",
-                "95% confidence interval",
-                "Primary evidence"
-            ]
+        "important_microbiome_note":
+            "Microbiome main performance is "
+            "sample/longitudinal OOF performance. "
+            "The donor-level R2 diagnostic is "
+            "not used as the component performance."
     }
 
     with open(
@@ -1273,79 +1157,33 @@ def main():
         )
 
     print(
+        f"Component results saved -> "
+        f"{FUSION_COMPONENT_PATH}"
+    )
+
+    print(
         f"Summary saved -> "
         f"{FUSION_SUMMARY_PATH}"
     )
 
-    # --------------------------------------------------------------
-    # FINAL REPORT
-    # --------------------------------------------------------------
-
-    print_header(
-        "FUSION TRAINING COMPLETE"
-    )
-
-    print()
-    print(
-        "RNA"
-    )
-
-    print(
-        f"  OOF R²  : "
-        f"{rna_component['raw_metrics']['r2']:.4f}"
-    )
-
-    print(
-        f"  OOF MAE : "
-        f"{rna_component['raw_metrics']['mae_hours']:.2f} h"
-    )
-
-    print()
-    print(
-        "MICROBIOME"
-    )
-
-    print(
-        f"  OOF R²  : "
-        f"{microbiome_component['raw_metrics']['r2']:.4f}"
-    )
-
-    print(
-        f"  OOF MAE : "
-        f"{microbiome_component['raw_metrics']['mae_hours']:.2f} h"
-    )
-
-    print()
-    print(
-        "FUSION"
-    )
-
-    print(
-        "  Type    : "
-        "Reliability-weighted late fusion"
-    )
-
-    print(
-        "  R²      : "
-        "NOT ESTIMABLE"
-    )
-
-    print(
-        "  Reason  : "
-        "RNA and microbiome datasets are unpaired."
-    )
-
-    print()
-    print(
-        "The fusion model is ready for deployment."
-    )
+    return result_df
 
 
 # ======================================================================
-# OPTIONAL DEPLOYMENT FUNCTION
+# DEPLOYMENT
 # ======================================================================
 
 def load_fusion_model():
+
+    if not os.path.exists(
+        FUSION_MODEL_PATH
+    ):
+
+        raise FileNotFoundError(
+            f"Fusion model not found:\n"
+            f"{FUSION_MODEL_PATH}\n\n"
+            f"Run fusion_model.py first."
+        )
 
     with open(
         FUSION_MODEL_PATH,
@@ -1360,31 +1198,30 @@ def deploy_fusion(
     microbiome_prediction_days
 ):
     """
-    Generate ONE final ForensicChrono PMI estimate.
+    Generate one final PMI estimate.
 
-    Parameters
-    ----------
+    INPUTS
+    ------
     rna_prediction_minutes:
-        PMI predicted by the RNA model, in minutes.
+        Prediction produced by the trained RNA model.
 
     microbiome_prediction_days:
-        PMI predicted by the microbiome model, in days.
+        Prediction produced by the trained microbiome model.
 
-    Returns
-    -------
+    OUTPUT
+    ------
     Dictionary containing:
-        final PMI
-        95% CI
-        model weights
+
+        RNA PMI
+        microbiome PMI
         uncertainties
+        reliability weights
+        final PMI
+        95% confidence interval
         primary evidence
     """
 
     package = load_fusion_model()
-
-    # --------------------------------------------------------------
-    # Reconstruct components
-    # --------------------------------------------------------------
 
     rna_component = {
 
@@ -1423,7 +1260,7 @@ def deploy_fusion(
     }
 
     # --------------------------------------------------------------
-    # Convert units
+    # Convert deployment predictions to hours
     # --------------------------------------------------------------
 
     rna_hours = (
@@ -1438,22 +1275,181 @@ def deploy_fusion(
         ) * 24.0
     )
 
-    # --------------------------------------------------------------
-    # Fuse
-    # --------------------------------------------------------------
-
-    result = fuse_predictions(
+    return fuse_predictions(
         rna_component,
         microbiome_component,
         rna_hours,
         microbiome_hours
     )
 
-    return result
+
+# ======================================================================
+# MAIN
+# ======================================================================
+
+def main():
+
+    print_header(
+        "FORENSICCHRONO"
+    )
+
+    print(
+        "RELIABILITY-WEIGHTED LATE FUSION"
+    )
+
+    print()
+    print(
+        "RNA + MICROBIOME"
+    )
+
+    print(
+        "No simulation."
+    )
+
+    print(
+        "No supervised cross-modal meta-model."
+    )
+
+    print(
+        "No artificial fusion R²."
+    )
+
+    # --------------------------------------------------------------
+    # LOAD
+    # --------------------------------------------------------------
+
+    rna_df = load_rna_oof()
+
+    microbiome_df = (
+        load_microbiome_oof()
+    )
+
+    # --------------------------------------------------------------
+    # CALIBRATION + UNCERTAINTY
+    # --------------------------------------------------------------
+
+    rna_component = (
+        prepare_component(
+            "RNA",
+            rna_df
+        )
+    )
+
+    microbiome_component = (
+        prepare_component(
+            "Microbiome",
+            microbiome_df
+        )
+    )
+
+    # --------------------------------------------------------------
+    # SAVE DEPLOYABLE MODEL
+    # --------------------------------------------------------------
+
+    save_fusion_model(
+        rna_component,
+        microbiome_component
+    )
+
+    # --------------------------------------------------------------
+    # SAVE METRICS
+    # --------------------------------------------------------------
+
+    save_results(
+        rna_component,
+        microbiome_component
+    )
+
+    # --------------------------------------------------------------
+    # FINAL REPORT
+    # --------------------------------------------------------------
+
+    print_header(
+        "FUSION TRAINING COMPLETE"
+    )
+
+    print()
+
+    print(
+        "RNA"
+    )
+
+    print(
+        f"  Samples : "
+        f"{len(rna_df)}"
+    )
+
+    print(
+        f"  Donors  : "
+        f"{rna_df['donor_id'].nunique()}"
+    )
+
+    print(
+        f"  OOF R²  : "
+        f"{rna_component['raw_metrics']['r2']:.4f}"
+    )
+
+    print(
+        f"  OOF MAE : "
+        f"{rna_component['raw_metrics']['mae_hours']:.2f} h"
+    )
+
+    print()
+
+    print(
+        "MICROBIOME"
+    )
+
+    print(
+        f"  Samples : "
+        f"{len(microbiome_df)}"
+    )
+
+    print(
+        f"  Donors  : "
+        f"{microbiome_df['donor_id'].nunique()}"
+    )
+
+    print(
+        f"  OOF R²  : "
+        f"{microbiome_component['raw_metrics']['r2']:.4f}"
+    )
+
+    print(
+        f"  OOF MAE : "
+        f"{microbiome_component['raw_metrics']['mae_hours']:.2f} h"
+    )
+
+    print()
+
+    print(
+        "FUSION"
+    )
+
+    print(
+        "  Type    : "
+        "Reliability-weighted late fusion"
+    )
+
+    print(
+        "  R²      : "
+        "NOT ESTIMABLE"
+    )
+
+    print(
+        "  Reason  : "
+        "RNA and microbiome cohorts are unpaired."
+    )
+
+    print()
+
+    print(
+        "Deployable fusion model ready."
+    )
 
 
 # ======================================================================
-# RUN
+# EXECUTE
 # ======================================================================
 
 if __name__ == "__main__":
