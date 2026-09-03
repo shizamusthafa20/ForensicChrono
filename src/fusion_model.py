@@ -807,19 +807,34 @@ def fuse_predictions(
     )
 
     # --------------------------------------------------------------
-    # DYNAMIC RELIABILITY WEIGHTS
+    # DYNAMIC RELIABILITY WEIGHTS & DOMAIN BOUNDARY (20 HOURS)
     # --------------------------------------------------------------
 
-    rna_weight = (
-        rna_precision /
-        total_precision
-    )
+      # --------------------------------------------------------------
+    # DOMAIN BOUNDARY (GTEx MAX TIME = 20 HOURS / 1200 MINS)
+    # If RNA prediction exceeds 20 hours, inflate its uncertainty
+    # so precision drops naturally, adjusting weights & final_sigma together.
+    # --------------------------------------------------------------
+    if rna_calibrated >= 20.0:
+        rna_sigma = max(rna_sigma, 50.0)
 
-    microbiome_weight = (
-        microbiome_precision /
-        total_precision
-    )
+    # --------------------------------------------------------------
+    # PRECISION & WEIGHTS
+    # --------------------------------------------------------------
+    rna_precision = 1.0 / (rna_sigma ** 2)
+    microbiome_precision = 1.0 / (microbiome_sigma ** 2)
+    total_precision = rna_precision + microbiome_precision
 
+    rna_weight = rna_precision / total_precision
+    microbiome_weight = microbiome_precision / total_precision
+
+    # --------------------------------------------------------------
+    # FINAL PMI
+    # --------------------------------------------------------------
+    final_pmi = (rna_weight * rna_calibrated) + (microbiome_weight * microbiome_calibrated)
+
+    # COMBINED UNCERTAINTY (Now 100% mathematically consistent)
+    final_sigma = np.sqrt(1.0 / total_precision)
     # --------------------------------------------------------------
     # FINAL PMI
     # --------------------------------------------------------------
