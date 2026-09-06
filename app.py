@@ -92,10 +92,29 @@ def predict_micro(pkg,otu,indoor,outdoor,env,site):
   q=float(np.asarray(m.predict(X)).ravel()[0]); q=np.expm1(q) if 'log' in n else q; vals[n]=q; ww=float(pkg['weights'].get(n,0)); total+=ww*q; w+=ww
  return max(0,total/w if w else np.mean(list(vals.values())))*24,X,fn,pkg['fitted_models'].get('xgb_direct')
 
-def shap_one(model,X,names):
+def shap_one(model,X,names,modality=None):
  if not SHAP_OK or model is None:return None,None
  try:
-  v=np.asarray(shap.TreeExplainer(model).shap_values(X)); v=v[0] if v.ndim==2 else v; ix=np.argsort(np.abs(v))[::-1][:10]; tab=pd.DataFrame({'Feature':[names[i] for i in ix],'SHAP contribution':[float(v[i]) for i in ix]}); fig,ax=plt.subplots(figsize=(8,5)); z=tab.iloc[::-1]; ax.barh(z.Feature,z['SHAP contribution']); ax.axvline(0,linewidth=1); ax.set_xlabel('SHAP contribution'); ax.set_title('Case-specific SHAP explanation'); plt.tight_layout(); return tab,fig
+  # Compute SHAP on the original trained model, then hide contextual
+  # covariates from the displayed ranking. The deployed model is unchanged.
+  v=np.asarray(shap.TreeExplainer(model).shap_values(X)); v=v[0] if v.ndim==2 else v
+  keep=[]
+  for i,n in enumerate(names):
+   nl=str(n).lower()
+   if modality == 'RNA':
+    if nl in {'rin','rin_squared','autolysis','autolysis_squared','age','sex','hardy','rin_x_autolysis','rin_over_autolysis_plus_1'}:
+     continue
+   elif modality == 'Microbiome':
+    if ('add' in nl or nl.startswith('environment_') or nl.startswith('body_site_')):
+     continue
+   keep.append(i)
+  if not keep:return None,None
+  ix=np.asarray(keep)[np.argsort(np.abs(v[keep]))[::-1][:10]]
+  tab=pd.DataFrame({'Feature':[names[i] for i in ix],'SHAP contribution':[float(v[i]) for i in ix]})
+  fig,ax=plt.subplots(figsize=(8,5)); z=tab.iloc[::-1]; ax.barh(z.Feature,z['SHAP contribution']); ax.axvline(0,linewidth=1); ax.set_xlabel('SHAP contribution')
+  title='Biological-feature SHAP explanation' if modality else 'Case-specific SHAP explanation'
+  ax.set_title(title + ('\n' if modality else ''))
+  plt.tight_layout(); return tab,fig
  except Exception:return None,None
 
 def calibrate_new_prediction(component, raw_prediction_hours):
@@ -201,7 +220,7 @@ def pdf(case,tissue,evidence,r,m,final,primary,rw,mw,tables):
  if r is not None:rows.append(['RNA degradation',pmi(r),f'{rw*100:.1f}%'])
  if m is not None:rows.append(['Microbial succession',pmi(m),f'{mw*100:.1f}%'])
  story.append(Table(rows,colWidths=[55*mm,65*mm,60*mm],style=[('BACKGROUND',(0,0),(-1,0),colors.HexColor('#12304a')),('TEXTCOLOR',(0,0),(-1,0),colors.white),('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('GRID',(0,0),(-1,-1),.3,colors.HexColor('#d7e0e7')),('FONTSIZE',(0,0),(-1,-1),8),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f6f9fb')])]))
- story.append(Paragraph('Case-specific Explainability',h)); story.append(Paragraph('SHAP was applied to the tree-based XGBoost direct-PMI component. Contributions describe model influence for this case and are not causal claims.',body))
+ story.append(Paragraph('Case-specific Explainability',h)); story.append(Paragraph('SHAP was applied to the tree-based XGBoost direct-PMI component. The biological-feature view hides contextual covariates (RNA clinical/QC variables; microbiome ADD/environment/body-site variables) from the displayed ranking; the underlying predictive model is unchanged. Contributions describe model influence for this case and are not causal claims.',body))
  for mod,tab in tables.items():
   if tab is not None:
    rows=[['Feature','SHAP contribution']]+[[str(x.Feature),f'{float(x["SHAP contribution"]):.4f}'] for _,x in tab.head(8).iterrows()]; story.append(Spacer(1,5)); story.append(Paragraph(mod,h)); story.append(Table(rows,colWidths=[125*mm,55*mm],style=[('BACKGROUND',(0,0),(-1,0),colors.HexColor('#edf5f7')),('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('GRID',(0,0),(-1,-1),.3,colors.HexColor('#d7e0e7')),('FONTSIZE',(0,0),(-1,-1),7.5),('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
@@ -319,7 +338,7 @@ if generate:
    r_hours,rX,rnames,rxgb=predict_rna(
     rna_pkg,tissue,expr,md
    )
-   r_tab,r_fig=shap_one(rxgb,rX,rnames)
+   r_tab,r_fig=shap_one(rxgb,rX,rnames,'RNA')
 
   except Exception as e:
    st.error(f'RNA processing error: {e}')
@@ -341,7 +360,7 @@ if generate:
    m_hours,mX,mnames,mxgb=predict_micro(
     micro_pkg,otu,indoor,outdoor,env,site
    )
-   m_tab,m_fig=shap_one(mxgb,mX,mnames)
+   m_tab,m_fig=shap_one(mxgb,mX,mnames,'Microbiome')
 
   except Exception as e:
    st.error(f'Microbiome processing error: {e}')
